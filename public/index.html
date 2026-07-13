@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="按模块提取 Shopify 产品页 MainContent 中的 section 和 div。">
+  <title>Shopify 模块提取器</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Shopify 模块提取器首页">
+      <span class="brand-mark">S</span>
+      <span>Module Copier</span>
+    </a>
+    <div class="topbar-actions">
+      <span class="top-note">提取渲染后的 HTML</span>
+      <button id="open-model-settings" class="settings-trigger" type="button" aria-haspopup="dialog">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h2M10 17h10M14 4v6M6 14v6"/></svg>
+        <span>模型配置</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="intro">
+      <p class="eyebrow">SHOPIFY PRODUCT PAGE</p>
+      <h1>把 MainContent 拆成<br>可复制的独立模块</h1>
+      <p class="lead">输入公开产品链接，自动识别一级 section 和 div。每个模块都能单独预览、复制和下载。</p>
+      <form id="extract-form" class="extract-form">
+        <label for="url">产品页面链接</label>
+        <div class="input-row">
+          <input id="url" name="url" type="url" required autocomplete="url" spellcheck="false" placeholder="https://example.com/products/product-name">
+          <button id="submit-button" type="submit">开始提取</button>
+        </div>
+        <p class="helper">仅访问公开页面，不绕过登录或访问限制。首次渲染通常需要几秒。</p>
+      </form>
+    </section>
+
+    <section id="status-panel" class="status-panel" aria-live="polite">
+      <div class="empty-visual" aria-hidden="true"><span>&lt;main&gt;</span><span>&lt;section&gt;</span><span>&lt;div&gt;</span></div>
+      <h2>等待产品链接</h2>
+      <p>提取后，模块会按照它们在页面中的原始顺序显示在这里。</p>
+    </section>
+
+    <section id="results" class="results" hidden>
+      <div class="results-head">
+        <div>
+          <a id="source-domain" class="source-domain" target="_blank" rel="noopener noreferrer"></a>
+          <h2 id="result-title">提取结果</h2>
+          <p id="result-meta" class="result-meta"></p>
+        </div>
+        <div class="result-actions">
+          <input id="filter" type="search" placeholder="搜索 id、class 或标题" aria-label="筛选模块">
+          <button id="copy-all" class="secondary" type="button">复制全部</button>
+        </div>
+      </div>
+      <section id="ai-workspace" class="ai-workspace" aria-labelledby="ai-workspace-title">
+        <div class="ai-workspace-head">
+          <div class="ai-workspace-copy">
+            <div class="ai-title-line">
+              <span class="ai-badge">AI</span>
+              <span id="ai-status" class="ai-connection" data-state="checking">正在检查配置</span>
+            </div>
+            <h3 id="ai-workspace-title">生成 Shopify Custom Liquid</h3>
+            <p id="ai-help">先排除不需要的模块，再添加全局文本替换。只有参与转换的模块会产生 API 用量。</p>
+          </div>
+          <div class="ai-batch-controls">
+            <span id="selection-count" class="selection-count">已选择 0 / 0 个模块</span>
+            <button id="generate-selected" class="ai-primary" type="button" disabled>生成选中模块</button>
+            <button id="copy-selected-liquid" class="secondary combined-copy-button" type="button" disabled>复制全部 Liquid</button>
+            <button id="cancel-generation" class="secondary" type="button" hidden>停止生成</button>
+            <span id="combined-liquid-meta" class="combined-liquid-meta" role="status" aria-live="polite" hidden></span>
+          </div>
+        </div>
+
+        <div class="replacement-editor">
+          <div class="replacement-heading">
+            <div>
+              <h4>全局文本替换</h4>
+              <p>只替换可见文字和 alt、title 等内容属性，不会修改类名、链接或脚本。</p>
+            </div>
+            <button id="add-replacement" class="secondary" type="button">添加替换</button>
+          </div>
+          <div id="replacement-list" class="replacement-list"></div>
+        </div>
+
+        <div id="batch-progress" class="batch-progress" role="status" aria-live="polite" hidden>
+          <div class="batch-progress-copy">
+            <strong id="batch-progress-title">准备生成</strong>
+            <span id="batch-progress-detail"></span>
+          </div>
+          <div id="batch-progress-track" class="progress-track" role="progressbar" aria-label="Custom Liquid 生成进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span id="batch-progress-bar"></span></div>
+        </div>
+
+        <section id="liquid-groups" class="liquid-groups" aria-labelledby="liquid-groups-title" hidden>
+          <div class="liquid-groups-head">
+            <div>
+              <h4 id="liquid-groups-title">分组复制 Liquid</h4>
+              <p>代码按产品页顺序分组。超出 Shopify 单个 Custom Liquid 容量的分组可继续单独拆分。</p>
+            </div>
+            <label class="liquid-group-size-control" for="liquid-group-size">
+              <span>每组最多</span>
+              <select id="liquid-group-size" aria-label="每组最多包含的模块数量"></select>
+              <span>个模块</span>
+            </label>
+          </div>
+          <div id="liquid-group-list" class="liquid-group-list"></div>
+        </section>
+      </section>
+      <div id="module-list" class="module-list"></div>
+    </section>
+  </main>
+
+  <dialog id="model-settings-dialog" class="settings-drawer" aria-labelledby="model-settings-title">
+    <div class="settings-drawer-shell">
+      <header class="settings-drawer-head">
+        <div>
+          <div class="settings-title-line">
+            <h2 id="model-settings-title">模型配置</h2>
+            <span id="model-settings-source" class="settings-source">读取中</span>
+          </div>
+          <p>切换 OpenAI 兼容接口和模型，保存后立即用于下一次生成。</p>
+        </div>
+        <button id="close-model-settings" class="settings-close" type="button" aria-label="关闭模型配置">×</button>
+      </header>
+
+      <form id="model-settings-form" class="settings-form">
+        <div class="settings-form-body">
+          <fieldset>
+            <legend>连接</legend>
+            <label class="settings-field" for="ai-base-url">
+              <span>API Base URL</span>
+              <input id="ai-base-url" name="baseUrl" type="url" required spellcheck="false" autocomplete="url" placeholder="https://api.deepseek.com">
+              <small>填写服务根地址，不要包含 <code>/chat/completions</code>。</small>
+            </label>
+
+            <label class="settings-field" for="ai-api-key">
+              <span>API Key</span>
+              <span class="secret-input">
+                <input id="ai-api-key" name="apiKey" type="password" spellcheck="false" autocomplete="off" placeholder="输入新的 API Key">
+                <button id="toggle-api-key" type="button" aria-label="显示 API Key" aria-pressed="false">显示</button>
+              </span>
+              <small id="api-key-help">留空会保留当前密钥，完整密钥不会返回浏览器。</small>
+            </label>
+
+            <label class="settings-field" for="ai-model">
+              <span>模型 ID</span>
+              <input id="ai-model" name="model" type="text" required list="model-suggestions" spellcheck="false" autocomplete="off" placeholder="deepseek-chat">
+              <datalist id="model-suggestions">
+                <option value="deepseek-chat"></option>
+                <option value="deepseek-reasoner"></option>
+                <option value="deepseek-v4-flash"></option>
+                <option value="deepseek-v4-pro"></option>
+              </datalist>
+              <small>可以直接输入服务商支持的任意模型 ID。</small>
+            </label>
+          </fieldset>
+
+          <fieldset>
+            <legend>生成参数</legend>
+            <div class="settings-grid">
+              <label class="settings-field" for="ai-thinking">
+                <span>推理模式</span>
+                <select id="ai-thinking" name="thinking">
+                  <option value="disabled">关闭，更快</option>
+                  <option value="enabled">开启，更慢</option>
+                </select>
+              </label>
+              <label class="settings-field" for="ai-timeout">
+                <span>超时秒数</span>
+                <input id="ai-timeout" name="timeoutSeconds" type="number" min="30" max="600" step="10" required>
+              </label>
+            </div>
+            <label class="settings-field" for="ai-max-tokens">
+              <span>最大输出 Tokens</span>
+              <input id="ai-max-tokens" name="maxTokens" type="number" min="4096" max="192000" step="1024" required>
+              <small>复杂模块需要更高上限；较小的值通常响应更快，但可能截断代码。</small>
+            </label>
+          </fieldset>
+
+          <div id="model-settings-status" class="settings-status" role="status" aria-live="polite">修改配置后可先测试连接。</div>
+        </div>
+
+        <footer class="settings-drawer-foot">
+          <button id="restore-env-settings" class="settings-text-button" type="button">恢复 .env</button>
+          <div>
+            <button id="test-model-settings" class="secondary" type="button">测试连接</button>
+            <button id="save-model-settings" class="ai-primary" type="submit">保存配置</button>
+          </div>
+        </footer>
+      </form>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

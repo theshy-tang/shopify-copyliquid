@@ -1,0 +1,8 @@
+node_modules/
+.env
+.ai-config.json
+.server.pid
+.impeccable/
+fixed-review-custom-liquid.liquid
+verify-*.png
+npm-debug.log*
