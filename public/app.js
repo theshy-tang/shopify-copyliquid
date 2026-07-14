@@ -33,16 +33,20 @@ const testModelSettingsButton = document.querySelector("#test-model-settings");
 const saveModelSettingsButton = document.querySelector("#save-model-settings");
 const restoreEnvSettingsButton = document.querySelector("#restore-env-settings");
 const apiBaseUrlInput = document.querySelector("#ai-base-url");
+const apiBaseUrlHelp = document.querySelector("#ai-base-url-help");
 const apiKeyInput = document.querySelector("#ai-api-key");
 const apiKeyHelp = document.querySelector("#api-key-help");
 const toggleApiKeyButton = document.querySelector("#toggle-api-key");
+const aiProviderInput = document.querySelector("#ai-provider");
 const aiModelInput = document.querySelector("#ai-model");
+const modelSuggestions = document.querySelector("#model-suggestions");
 const aiThinkingInput = document.querySelector("#ai-thinking");
 const aiTimeoutInput = document.querySelector("#ai-timeout");
 const aiMaxTokensInput = document.querySelector("#ai-max-tokens");
 
 let extraction = null;
-let aiConfig = { configured: false, model: "deepseek-v4-flash", checking: true, mock: false };
+let aiConfig = { configured: false, provider: "deepseek", model: "deepseek-v4-flash", checking: true, mock: false };
+let loadedModelSettings = null;
 let previewLoadObserver = null;
 let replacementRows = [];
 let batchController = null;
@@ -84,6 +88,7 @@ function setModelSettingsBusy(busy) {
 
 function modelSettingsPayload() {
   return {
+    provider: aiProviderInput.value,
     baseUrl: apiBaseUrlInput.value.trim(),
     apiKey: apiKeyInput.value.trim(),
     model: aiModelInput.value.trim(),
@@ -93,7 +98,40 @@ function modelSettingsPayload() {
   };
 }
 
+function providerName(provider) {
+  if (provider === "newapi") return "New API";
+  if (provider === "deepseek") return "DeepSeek";
+  return "OpenAI 兼容接口";
+}
+
+function renderModelSuggestions(values = []) {
+  const defaults = aiProviderInput.value === "deepseek"
+    ? ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"]
+    : [];
+  const models = [...new Set([...values, ...defaults].map((value) => String(value || "").trim()).filter(Boolean))];
+  modelSuggestions.innerHTML = models.map((model) => `<option value="${escapeHtml(model)}"></option>`).join("");
+}
+
+function updateProviderFields(provider = aiProviderInput.value) {
+  if (provider === "newapi") {
+    apiBaseUrlInput.placeholder = "https://你的-newapi-域名/v1";
+    apiBaseUrlHelp.innerHTML = "填写 New API 平台地址；保存时会自动补全 <code>/v1</code>，不要包含具体接口路径。";
+    aiModelInput.placeholder = "测试连接后选择模型，或直接输入模型 ID";
+  } else if (provider === "deepseek") {
+    apiBaseUrlInput.placeholder = "https://api.deepseek.com";
+    apiBaseUrlHelp.innerHTML = "填写 DeepSeek 服务根地址，不要包含 <code>/chat/completions</code>。";
+    aiModelInput.placeholder = "deepseek-chat";
+  } else {
+    apiBaseUrlInput.placeholder = "https://api.example.com/v1";
+    apiBaseUrlHelp.innerHTML = "填写 OpenAI 兼容 Base URL，不要包含 <code>/chat/completions</code>。";
+    aiModelInput.placeholder = "输入接口支持的模型 ID";
+  }
+  renderModelSuggestions();
+}
+
 function populateModelSettings(data) {
+  aiProviderInput.value = data.provider || "deepseek";
+  updateProviderFields(aiProviderInput.value);
   apiBaseUrlInput.value = data.baseUrl || "https://api.deepseek.com";
   aiModelInput.value = data.model === "mock" ? "deepseek-v4-flash" : (data.model || "deepseek-v4-flash");
   aiThinkingInput.value = data.thinking === "enabled" ? "enabled" : "disabled";
@@ -110,6 +148,7 @@ function populateModelSettings(data) {
     : "尚未保存密钥，请输入 API Key。";
   modelSettingsSource.dataset.source = data.source || "environment";
   modelSettingsSource.textContent = data.source === "manual" ? "手动配置" : ".env 配置";
+  loadedModelSettings = data;
 }
 
 async function loadModelSettings() {
@@ -595,7 +634,7 @@ function markLiquidResultsStale() {
 }
 
 function liquidStatusMarkup(index) {
-  if (!includedModules.has(index)) return '<span class="status-dot"></span><span>已排除，不会发送给 DeepSeek</span>';
+  if (!includedModules.has(index)) return '<span class="status-dot"></span><span>已排除，不会发送给模型</span>';
   const result = liquidResults.get(index);
   if (!result) return "";
   if (result.status === "loading") return '<span class="status-pulse" aria-hidden="true"></span><span>正在精简重复资源并请求模型，大模块会先压缩再发送</span>';
@@ -863,7 +902,7 @@ function renderModules(query = "") {
           <button type="button" class="visibility-toggle" data-action="toggle-inclusion" aria-pressed="${included}" aria-label="${included ? `排除模块 ${module.index}` : `恢复模块 ${module.index}`}">${eyeIcon(included)}</button>
         </div>
       </div>
-      <p class="excluded-note">模块已排除，不会发送给 DeepSeek。点击眼睛图标可恢复。</p>
+      <p class="excluded-note">模块已排除，不会发送给模型。点击眼睛图标可恢复。</p>
       <div class="module-toolbar">
         ${reviewLimitMarkup(module)}
         <div class="view-controls" role="group" aria-label="模块视图">
@@ -1173,8 +1212,23 @@ toggleApiKeyButton.addEventListener("click", () => {
   toggleApiKeyButton.setAttribute("aria-label", reveal ? "隐藏 API Key" : "显示 API Key");
 });
 
+aiProviderInput.addEventListener("change", () => {
+  const provider = aiProviderInput.value;
+  const changedProvider = provider !== loadedModelSettings?.provider;
+  if (changedProvider) {
+    apiBaseUrlInput.value = provider === "deepseek" ? "https://api.deepseek.com" : "";
+    aiModelInput.value = provider === "deepseek" ? "deepseek-chat" : "";
+    apiKeyInput.value = "";
+    apiKeyInput.placeholder = provider === "newapi" ? "输入 New API 平台 Token" : "输入新的 API Key";
+    apiKeyHelp.textContent = `切换到 ${providerName(provider)} 后，需要输入对应服务的 API Key。`;
+    aiThinkingInput.value = "disabled";
+  }
+  updateProviderFields(provider);
+  setModelSettingsStatus(`请填写 ${providerName(provider)} 的地址、API Key 和模型`, "checking");
+});
+
 testModelSettingsButton.addEventListener("click", async () => {
-  if (!modelSettingsForm.reportValidity()) return;
+  if (!apiBaseUrlInput.reportValidity()) return;
   setModelSettingsBusy(true);
   setModelSettingsStatus("正在测试 API 和模型连接", "checking");
   try {
@@ -1185,10 +1239,14 @@ testModelSettingsButton.addEventListener("click", async () => {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "连接测试失败");
-    const state = data.modelAvailable === false ? "checking" : "success";
-    const message = data.modelAvailable === false
-      ? `API 连接成功，但模型列表中没有 ${aiModelInput.value.trim()}`
-      : data.message;
+    renderModelSuggestions(data.models || []);
+    if (!aiModelInput.value.trim() && data.models?.length) aiModelInput.value = data.models[0];
+    const selectedModel = aiModelInput.value.trim();
+    const selectedAvailable = data.models?.length ? data.models.includes(selectedModel) : data.modelAvailable;
+    const state = selectedAvailable === false ? "checking" : "success";
+    const message = selectedAvailable === false
+      ? `API 连接成功，但模型列表中没有 ${selectedModel}`
+      : (data.models?.length ? `连接成功，已读取 ${data.models.length} 个可用模型` : data.message);
     setModelSettingsStatus(message, state);
   } catch (error) {
     setModelSettingsStatus(error.message, "error");
@@ -1253,19 +1311,19 @@ async function loadAiStatus() {
     aiConfig = { ...data, checking: false };
     if (data.configured) {
       aiStatusLabel.dataset.state = "ready";
-      aiStatusLabel.textContent = data.mock ? "模拟模式" : `${data.model} 已就绪`;
+      aiStatusLabel.textContent = data.mock ? "模拟模式" : `${providerName(data.provider)} · ${data.model} 已就绪`;
       aiHelp.textContent = data.mock
-        ? "当前为本地流程验证模式，不会调用 DeepSeek 或产生费用。"
-        : `${data.source === "manual" ? "手动配置" : ".env 配置"}。先排除不需要的模块，再生成 Custom Liquid。`;
+        ? "当前为本地流程验证模式，不会调用外部模型或产生费用。"
+        : `${data.source === "manual" ? "手动配置" : ".env 配置"}，当前使用 ${providerName(data.provider)}。先排除不需要的模块，再生成 Custom Liquid。`;
     } else {
       aiStatusLabel.dataset.state = "warning";
       aiStatusLabel.textContent = "尚未配置 API Key";
       aiHelp.textContent = "点击右上角“模型配置”，填写 API 地址、密钥和模型 ID。";
     }
   } catch {
-    aiConfig = { configured: false, model: "deepseek-v4-flash", checking: false, mock: false };
+    aiConfig = { configured: false, provider: "deepseek", model: "deepseek-v4-flash", checking: false, mock: false };
     aiStatusLabel.dataset.state = "error";
-    aiStatusLabel.textContent = "无法检查 DeepSeek 配置";
+    aiStatusLabel.textContent = "无法检查模型配置";
     aiHelp.textContent = "无法读取服务端 AI 状态，请确认本地服务已经启动后重试。";
   }
   updateBatchControls();

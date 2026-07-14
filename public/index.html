@@ -129,10 +129,19 @@
         <div class="settings-form-body">
           <fieldset>
             <legend>连接</legend>
+            <label class="settings-field" for="ai-provider">
+              <span>接口类型</span>
+              <select id="ai-provider" name="provider">
+                <option value="deepseek">DeepSeek 官方</option>
+                <option value="newapi">New API 网关</option>
+                <option value="custom">其他 OpenAI 兼容接口</option>
+              </select>
+              <small>New API 使用平台 Token，并通过 OpenAI 兼容接口生成 Liquid。</small>
+            </label>
             <label class="settings-field" for="ai-base-url">
               <span>API Base URL</span>
               <input id="ai-base-url" name="baseUrl" type="url" required spellcheck="false" autocomplete="url" placeholder="https://api.deepseek.com">
-              <small>填写服务根地址，不要包含 <code>/chat/completions</code>。</small>
+              <small id="ai-base-url-help">填写服务根地址，不要包含 <code>/chat/completions</code>。</small>
             </label>
 
             <label class="settings-field" for="ai-api-key">
@@ -185,7 +194,7 @@
         <footer class="settings-drawer-foot">
           <button id="restore-env-settings" class="settings-text-button" type="button">恢复 .env</button>
           <div>
-            <button id="test-model-settings" class="secondary" type="button">测试连接</button>
+            <button id="test-model-settings" class="secondary" type="button">测试并读取模型</button>
             <button id="save-model-settings" class="ai-primary" type="submit">保存配置</button>
           </div>
         </footer>

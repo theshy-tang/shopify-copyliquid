@@ -262,6 +262,43 @@ test("server conversion automatically compacts an oversize provider result", asy
   assert.ok(result.shopifyAudit.originalBytes > 49_000);
 });
 
+test("New API uses the OpenAI-compatible v1 endpoint and generic reasoning option", async () => {
+  let requestUrl = "";
+  let requestHeaders;
+  let requestBody;
+  const fetchImpl = async (url, init) => {
+    requestUrl = url;
+    requestHeaders = init.headers;
+    requestBody = JSON.parse(init.body);
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ code: '<div id="ai-liquid-test-3">Ready</div>', summary: "已生成", warnings: [] }) }, finish_reason: "stop" }],
+      usage: { total_tokens: 12 },
+      model: "gateway-model"
+    }), { status: 200 });
+  };
+  const result = await convertModuleToCustomLiquid({
+    module: moduleFixture,
+    css: "",
+    sourceUrl: "https://store.example/products/item",
+    replacements: [],
+    namespace: "ai-liquid-test-3",
+    env: {
+      AI_PROVIDER: "newapi",
+      AI_API_KEY: "newapi-token",
+      AI_BASE_URL: "https://gateway.example.com",
+      AI_MODEL: "gateway-model",
+      AI_THINKING: "enabled"
+    },
+    fetchImpl
+  });
+  assert.equal(requestUrl, "https://gateway.example.com/v1/chat/completions");
+  assert.equal(requestHeaders.Authorization, "Bearer newapi-token");
+  assert.equal(requestBody.model, "gateway-model");
+  assert.equal(requestBody.reasoning_effort, "high");
+  assert.equal("thinking" in requestBody, false);
+  assert.equal(result.model, "gateway-model");
+});
+
 test("unsafe generated network scripts are rejected", () => {
   assert.throws(
     () => validateCustomLiquid('<div id="ai-liquid-test-3"></div><script>fetch("https://example.com")</script>', "ai-liquid-test-3"),

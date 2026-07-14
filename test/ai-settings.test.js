@@ -13,9 +13,33 @@ test("manual AI settings accept custom model IDs and preserve a stored key", () 
     timeoutMs: 90000
   }, { apiKey: "stored-secret" });
   assert.equal(settings.apiKey, "stored-secret");
+  assert.equal(settings.provider, "custom");
   assert.equal(settings.baseUrl, "https://gateway.example.com/v1");
   assert.equal(settings.model, "provider/fast-model-v2");
   assert.equal(settings.timeoutMs, 90000);
+});
+
+test("New API settings append v1 and never reuse a key from another endpoint", () => {
+  const settings = normalizeAiSettings({
+    provider: "newapi",
+    baseUrl: "https://gateway.example.com",
+    model: "gpt-4o-mini",
+    apiKey: ""
+  }, {
+    provider: "deepseek",
+    baseUrl: "https://api.deepseek.com",
+    apiKey: "deepseek-secret"
+  });
+  assert.equal(settings.provider, "newapi");
+  assert.equal(settings.baseUrl, "https://gateway.example.com/v1");
+  assert.equal(settings.apiKey, "");
+
+  const sameEndpoint = normalizeAiSettings({
+    provider: "newapi",
+    baseUrl: "https://gateway.example.com/v1/",
+    model: "gpt-4o-mini"
+  }, { ...settings, apiKey: "newapi-secret" });
+  assert.equal(sameEndpoint.apiKey, "newapi-secret");
 });
 
 test("manual AI settings reject plaintext remote API endpoints", () => {
@@ -34,6 +58,7 @@ test("public AI settings never expose the complete API key", () => {
   }), {}));
   const output = publicAiSettings(config, "manual");
   assert.equal(output.hasApiKey, true);
+  assert.equal(output.provider, "custom");
   assert.equal(output.apiKeyHint, "••••5678");
   assert.equal("apiKey" in output, false);
   assert.equal(output.model, "fast-model");

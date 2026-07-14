@@ -403,6 +403,7 @@ app.get("/api/ai/status", (_req, res) => {
   const config = effectiveAiConfig();
   res.json({
     configured: config.configured,
+    provider: config.provider,
     model: config.mock ? "mock" : config.model,
     thinking: config.thinking,
     mock: config.mock,
@@ -457,7 +458,7 @@ app.post("/api/ai/test", async (req, res) => {
         ? `连接成功，已找到模型 ${settings.model}`
         : (modelIds.length ? `连接成功，但模型列表中没有 ${settings.model}` : "连接成功，模型列表接口可用"),
       modelAvailable: modelIds.length ? modelIds.includes(settings.model) : null,
-      models: modelIds.slice(0, 30)
+      models: modelIds.slice(0, 100)
     });
   } catch (error) {
     const message = error?.name === "AbortError" ? "连接测试超时" : error.message;
@@ -521,7 +522,14 @@ app.post("/api/convert", async (req, res) => {
 
 app.get("/api/health", (_req, res) => {
   const ai = effectiveAiConfig();
-  res.json({ ok: true, deepseekConfigured: ai.configured, deepseekModel: ai.mock ? "mock" : ai.model });
+  res.json({
+    ok: true,
+    aiConfigured: ai.configured,
+    aiProvider: ai.provider,
+    aiModel: ai.mock ? "mock" : ai.model,
+    deepseekConfigured: ai.configured,
+    deepseekModel: ai.mock ? "mock" : ai.model
+  });
 });
 
 app.listen(port, () => {

@@ -18,7 +18,7 @@ $env:CHROME_PATH='C:\你的路径\chrome.exe'
 npm.cmd start
 ```
 
-## 配置 DeepSeek
+## 配置模型接口
 
 API Key 只由服务端读取，不会写入浏览器代码或提取结果。先复制配置模板：
 
@@ -26,22 +26,36 @@ API Key 只由服务端读取，不会写入浏览器代码或提取结果。先
 Copy-Item .env.example .env
 ```
 
-然后编辑 `.env`：
+DeepSeek 示例：
 
 ```dotenv
-DEEPSEEK_API_KEY=你的_API_Key
-DEEPSEEK_MODEL=deepseek-v4-flash
-DEEPSEEK_THINKING=disabled
+AI_PROVIDER=deepseek
+AI_API_KEY=你的_API_Key
+AI_BASE_URL=https://api.deepseek.com
+AI_MODEL=deepseek-v4-flash
+AI_THINKING=disabled
 ```
 
-保存后重启 `npm.cmd start`。默认使用当前的 `deepseek-v4-flash`；需要更高质量时可改为 `deepseek-v4-pro`。`.env` 已加入 `.gitignore`，不要提交或发送 API Key。
+New API 示例：
 
-本地验证完整交互但不调用 DeepSeek 时，可以临时设置 `DEEPSEEK_MOCK=1`。模拟结果只用于验证流程，不能代表 AI 改写质量。
+```dotenv
+AI_PROVIDER=newapi
+AI_API_KEY=你的_New_API_平台_Token
+AI_BASE_URL=https://你的-newapi-域名/v1
+AI_MODEL=平台中的模型_ID
+AI_THINKING=disabled
+```
+
+也可以启动项目后打开右上角“模型配置”，选择“New API 网关”，输入平台地址和 Token，然后点击“测试并读取模型”。平台返回的模型会自动加入模型输入框建议。
+
+保存后重启 `npm.cmd start`。`.env` 已加入 `.gitignore`，不要提交或发送 API Key。New API 使用 OpenAI 兼容的 `GET /v1/models` 和 `POST /v1/chat/completions` 接口。
+
+本地验证完整交互但不调用外部模型时，可以临时设置 `AI_MOCK=1`。模拟结果只用于验证流程，不能代表 AI 改写质量。
 
 ## Custom Liquid 工作流
 
 1. 提取产品页后，所有模块默认参与转换。
-2. 点击模块右侧眼睛图标可排除模块；排除的模块不会发送给 DeepSeek，也不会产生对应 API 用量。
+2. 点击模块右侧眼睛图标可排除模块；排除的模块不会发送给模型，也不会产生对应 API 用量。
 3. 在顶部添加“原文本 → 替换为”规则。替换只处理可见文本以及 `alt`、`title` 等内容属性，不会修改类名、链接和脚本。
 4. 可以逐个生成，也可以按顺序生成所有选中且尚未生成的模块。
 5. 每个结果都能切换 Liquid 预览和 Liquid 代码，并支持复制、下载和重新生成。
@@ -50,7 +64,7 @@ DEEPSEEK_THINKING=disabled
 
 生成结果面向 Shopify 主题编辑器中的“Custom Liquid”模块，不包含 `{% schema %}`、完整 HTML 文档或主题 Section 文件。生成脚本会在没有同源权限的隔离 iframe 中预览；服务端会阻止外部脚本、网络请求和访问父页面状态的生成代码。
 
-DeepSeek 的认证失败、余额不足、限流、服务过载、超时、输出截断和格式异常都会显示具体原因。提取上下文在服务端内存中保留 30 分钟，过期后需要重新提取页面。
+模型接口的认证失败、余额不足、限流、服务过载、超时、输出截断和格式异常都会显示具体原因。提取上下文在服务端内存中保留 30 分钟，过期后需要重新提取页面。
 
 ## 提取规则
 
