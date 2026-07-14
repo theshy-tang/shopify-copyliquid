@@ -3,9 +3,12 @@ import assert from "node:assert/strict";
 import {
   ConversionError,
   applyTextReplacements,
+  auditModuleCustomLiquid,
   auditReviewCustomLiquid,
   compactCustomLiquidCode,
   convertModuleToCustomLiquid,
+  extractFaqInventory,
+  extractModuleRequirements,
   extractReviewInventory,
   getDeepSeekConfig,
   limitImageReviewSource,
@@ -41,6 +44,32 @@ const imageReviewModuleFixture = {
   html: `<section class="testimonials"><div class="splide__list">${reviewItems.map((item, index) => `<article class="testimonial-card splide__slide"><img src="https://cdn.example/review-${index + 1}.jpg" alt=""><p>${item}</p></article>`).join("")}</div></section>`
 };
 
+const mediaTextModuleFixture = {
+  index: 2,
+  tag: "div",
+  id: "media-text",
+  heading: "Reveal Softer Skin",
+  originalSize: { width: 1440, height: 700 },
+  html: '<section class="custom-columns"><div class="custom-columns__block-image"><img src="https://cdn.example/image.jpg" alt="Product ingredients"></div><div class="custom-columns__block-icon_with_text"><h2>Reveal Softer Skin</h2><p>Rich daily nourishment.</p></div></section>'
+};
+
+const faqModuleFixture = {
+  index: 13,
+  tag: "section",
+  id: "faq",
+  heading: "Frequently Asked Questions",
+  originalSize: { width: 1440, height: 600 },
+  html: '<section class="collapsible-content"><details><summary>Can I use it daily?</summary><div class="accordion__content">Yes, use a small amount once or twice daily.</div></details><details><summary>Is it suitable for sensitive skin?</summary><div class="accordion__content">Patch test first and stop use if irritation occurs.</div></details></section>'
+};
+
+function mediaTextLiquidCode() {
+  return `<section id="ai-liquid-media-2"><div class="layout"><div class="media"><img src="https://cdn.example/image.jpg" alt="Product ingredients"></div><div class="copy"><h2>Reveal Softer Skin</h2><p>Rich daily nourishment.</p></div></div></section><style>#ai-liquid-media-2 .layout{display:grid;grid-template-columns:1fr;gap:24px}@media(min-width:750px){#ai-liquid-media-2 .layout{grid-template-columns:1fr 1fr}}</style>`;
+}
+
+function faqLiquidCode() {
+  return `<section id="ai-liquid-faq-13"><h2>Frequently Asked Questions</h2><details><summary>Can I use it daily?</summary><div class="answer">Yes, use a small amount once or twice daily.</div></details><details><summary>Is it suitable for sensitive skin?</summary><div class="answer">Patch test first and stop use if irritation occurs.</div></details></section><style>#ai-liquid-faq-13 details{border-bottom:1px solid #ddd}#ai-liquid-faq-13 summary{cursor:pointer}</style>`;
+}
+
 function reviewLiquidCode(items = reviewItems) {
   return `<section id="ai-liquid-review-10">
   <button type="button" aria-label="Previous review">&lt;</button>
@@ -68,6 +97,41 @@ test("global replacements change visible text and content attributes but not scr
   assert.match(result.html, /alt="New Product"/);
   assert.match(result.html, /const label = "Original Product"/);
   assert.equal(result.counts[0].count, 2);
+});
+
+test("media and text modules require desktop columns and a mobile stack", () => {
+  const requirements = extractModuleRequirements(
+    mediaTextModuleFixture,
+    mediaTextModuleFixture.html,
+    ".custom-columns{display:flex}.custom-columns>div{width:50%}"
+  );
+  assert.equal(requirements.mediaText, true);
+
+  const verticalOnly = '<section id="ai-liquid-media-2"><img src="https://cdn.example/image.jpg"><p>Rich daily nourishment.</p></section><style>#ai-liquid-media-2{display:block}</style>';
+  const badAudit = auditModuleCustomLiquid(verticalOnly, requirements);
+  assert.equal(badAudit.ok, false);
+  assert.equal(badAudit.checks.hasDesktopColumns, false);
+
+  const goodAudit = auditModuleCustomLiquid(mediaTextLiquidCode(), requirements);
+  assert.equal(goodAudit.ok, true);
+  assert.equal(goodAudit.checks.hasDesktopColumns, true);
+  assert.equal(goodAudit.checks.hasResponsiveBreakpoint, true);
+});
+
+test("FAQ inventory and audit require complete native disclosure items", () => {
+  const faq = extractFaqInventory(faqModuleFixture.html);
+  assert.equal(faq.count, 2);
+  assert.match(faq.items[0].answer, /once or twice daily/);
+  const requirements = extractModuleRequirements(faqModuleFixture, faqModuleFixture.html, "");
+
+  const questionsOnly = '<section id="ai-liquid-faq-13"><p>Can I use it daily?</p><p>Is it suitable for sensitive skin?</p></section>';
+  const badAudit = auditModuleCustomLiquid(questionsOnly, requirements);
+  assert.equal(badAudit.ok, false);
+  assert.equal(badAudit.checks.faqOutputCount, 0);
+
+  const goodAudit = auditModuleCustomLiquid(faqLiquidCode(), requirements);
+  assert.equal(goodAudit.ok, true);
+  assert.equal(goodAudit.checks.faqSemanticCount, 2);
 });
 
 test("review inventory finds every unique testimonial card", () => {
@@ -171,6 +235,64 @@ test("incomplete AI review output is automatically repaired and re-audited", asy
   assert.equal(result.reviewAudit.repaired, true);
   assert.equal(result.reviewAudit.outputCount, 3);
   assert.equal(result.usage.total_tokens, 190);
+});
+
+test("desktop media and text layout is automatically repaired when the model stacks it", async () => {
+  const requests = [];
+  const verticalOnly = '<section id="ai-liquid-media-2"><img src="https://cdn.example/image.jpg" alt="Product ingredients"><h2>Reveal Softer Skin</h2><p>Rich daily nourishment.</p></section><style>#ai-liquid-media-2{display:block}</style>';
+  const providerResponse = (code) => new Response(JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({ code, summary: "generated", warnings: [] }) }, finish_reason: "stop" }],
+    usage: { total_tokens: 20 },
+    model: "deepseek-v4-flash"
+  }), { status: 200 });
+  const fetchImpl = async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    return providerResponse(requests.length === 1 ? verticalOnly : mediaTextLiquidCode());
+  };
+
+  const result = await convertModuleToCustomLiquid({
+    module: mediaTextModuleFixture,
+    css: ".custom-columns{display:flex}.custom-columns>div{width:50%}",
+    sourceUrl: "https://store.example/products/item",
+    replacements: [],
+    namespace: "ai-liquid-media-2",
+    env: { DEEPSEEK_API_KEY: "test-key" },
+    fetchImpl
+  });
+
+  assert.equal(requests.length, 2);
+  assert.match(requests[0].messages[1].content, /Never stack them vertically on desktop/);
+  assert.match(requests[1].messages[1].content, /CURRENT AUDIT FAILURES/);
+  assert.equal(result.moduleAudit.repaired, true);
+  assert.equal(result.moduleAudit.hasDesktopColumns, true);
+});
+
+test("FAQ conversion keeps native details and adds a full-height expansion safeguard", async () => {
+  const requests = [];
+  const fetchImpl = async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ code: faqLiquidCode(), summary: "generated", warnings: [] }) }, finish_reason: "stop" }],
+      usage: { total_tokens: 20 },
+      model: "deepseek-v4-flash"
+    }), { status: 200 });
+  };
+
+  const result = await convertModuleToCustomLiquid({
+    module: faqModuleFixture,
+    css: ".accordion__content-wrapper{display:grid;grid-template-rows:0fr;overflow:hidden}",
+    sourceUrl: "https://store.example/products/item",
+    replacements: [],
+    namespace: "ai-liquid-faq-13",
+    env: { DEEPSEEK_API_KEY: "test-key" },
+    fetchImpl
+  });
+
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].messages[1].content, /Use one native <details> element per FAQ item/);
+  assert.match(result.code, /data-ai-faq-expansion/);
+  assert.match(result.code, /max-height:none!important/);
+  assert.equal(result.moduleAudit.faqOutputCount, 2);
 });
 
 test("conversion audits only the selected number of image reviews", async () => {

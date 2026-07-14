@@ -399,6 +399,19 @@ app.post("/api/extract", async (req, res) => {
   }
 });
 
+// Load a module's captured CSS lazily so the initial extraction payload stays small.
+app.get("/api/extract/:extractionId/module/:moduleIndex/css", (req, res) => {
+  pruneExtractionSessions();
+  const extractionId = String(req.params.extractionId || "").trim();
+  const moduleIndex = Number(req.params.moduleIndex);
+  const session = extractionSessions.get(extractionId);
+  if (!session) return res.status(410).json({ error: "EXTRACTION_EXPIRED" });
+  const module = session.modules.find((item) => item.index === moduleIndex);
+  if (!module) return res.status(404).json({ error: "MODULE_NOT_FOUND" });
+  res.set("Cache-Control", "no-store");
+  res.json({ css: String(module.css || "") });
+});
+
 app.get("/api/ai/status", (_req, res) => {
   const config = effectiveAiConfig();
   res.json({

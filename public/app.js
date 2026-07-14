@@ -40,6 +40,8 @@ const toggleApiKeyButton = document.querySelector("#toggle-api-key");
 const aiProviderInput = document.querySelector("#ai-provider");
 const aiModelInput = document.querySelector("#ai-model");
 const modelSuggestions = document.querySelector("#model-suggestions");
+const modelResultsField = document.querySelector("#ai-model-results-field");
+const modelResultsSelect = document.querySelector("#ai-model-results");
 const aiThinkingInput = document.querySelector("#ai-thinking");
 const aiTimeoutInput = document.querySelector("#ai-timeout");
 const aiMaxTokensInput = document.querySelector("#ai-max-tokens");
@@ -59,6 +61,7 @@ const reviewLimits = new Map();
 const replacementCorpusCache = new Map();
 const previewStates = new WeakMap();
 const liquidPreviewBridges = new Map();
+const moduleCssCache = new Map();
 const SHOPIFY_CUSTOM_LIQUID_SAFE_BYTES = 49_000;
 
 const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, (char) => ({
@@ -105,11 +108,15 @@ function providerName(provider) {
 }
 
 function renderModelSuggestions(values = []) {
+  const fetchedModels = [...new Set(values.map((value) => String(value || "").trim()).filter(Boolean))];
   const defaults = aiProviderInput.value === "deepseek"
     ? ["deepseek-chat", "deepseek-reasoner", "deepseek-v4-flash", "deepseek-v4-pro"]
     : [];
-  const models = [...new Set([...values, ...defaults].map((value) => String(value || "").trim()).filter(Boolean))];
+  const models = [...new Set([...fetchedModels, ...defaults])];
   modelSuggestions.innerHTML = models.map((model) => `<option value="${escapeHtml(model)}"></option>`).join("");
+  modelResultsField.hidden = fetchedModels.length === 0;
+  modelResultsSelect.innerHTML = `<option value="">选择一个模型（共 ${fetchedModels.length} 个）</option>${fetchedModels.map((model) => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join("")}`;
+  modelResultsSelect.value = fetchedModels.includes(aiModelInput.value.trim()) ? aiModelInput.value.trim() : "";
 }
 
 function updateProviderFields(provider = aiProviderInput.value) {
@@ -236,7 +243,7 @@ function downloadOriginalModule(module) {
   );
 }
 
-function previewSource(module) {
+function previewSource(module, capturedCss = "") {
   const rootAttributes = attributesMarkup(extraction.rootAttributes);
   const bodyAttributes = attributesMarkup(extraction.bodyAttributes);
   const isTestimonialModule = module.html.includes("testimonial-card") && module.html.includes("splide__list");
@@ -252,7 +259,26 @@ body[data-static-testimonials="true"] .splide__pagination { display: none !impor
 @media (max-width: 1024px) { body[data-static-testimonials="true"] .splide__list { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; } }
 @media (max-width: 600px) { body[data-static-testimonials="true"] .splide__list { grid-template-columns: 1fr !important; gap: 1rem !important; } }
 </style>` : "";
-  return `<!doctype html><html ${rootAttributes}><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><base href="${escapeHtml(extraction.url)}">${sourceStyleMarkup()}${staticOverrides}</head><body ${bodyAttributes}${testimonialAttribute}>${module.html}</body></html>`;
+  const safeCapturedCss = String(capturedCss || "").replace(/<\/style/gi, "<\\/style");
+  const moduleStyle = safeCapturedCss ? `<style data-module-captured-css>${safeCapturedCss}</style>` : "";
+  return `<!doctype html><html ${rootAttributes}><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><base href="${escapeHtml(extraction.url)}">${sourceStyleMarkup()}${moduleStyle}${staticOverrides}</head><body ${bodyAttributes}${testimonialAttribute}>${module.html}</body></html>`;
+}
+
+async function loadModuleCss(module) {
+  if (module.css) return String(module.css);
+  const extractionId = extraction?.extractionId;
+  if (!extractionId) return "";
+  const cacheKey = `${extractionId}:${module.index}`;
+  if (moduleCssCache.has(cacheKey)) return moduleCssCache.get(cacheKey);
+  const request = fetch(`/api/extract/${encodeURIComponent(extractionId)}/module/${encodeURIComponent(module.index)}/css`)
+    .then(async (response) => {
+      if (!response.ok) throw new Error("MODULE_CSS_LOAD_FAILED");
+      const payload = await response.json();
+      return String(payload.css || "");
+    })
+    .catch(() => "");
+  moduleCssCache.set(cacheKey, request);
+  return request;
 }
 
 function boundedPixelValue(value, fallback, minimum, maximum) {
@@ -452,13 +478,16 @@ function setPreviewWidth(detail, width) {
   resizePreview(detail);
 }
 
-function mountOriginalPreview(detail, module) {
+async function mountOriginalPreview(detail, module) {
   closePreview(detail);
   const sourceWidth = extraction.viewport?.width || 1440;
+  detail.innerHTML = `${previewHeader(sourceWidth, false)}<div class="preview-stage preview-stage-loading"><div class="preview-loading">正在加载模块样式</div></div>`;
+  const capturedCss = await loadModuleCss(module);
+  if (detail.dataset.mode !== "preview") return;
   detail.innerHTML = `${previewHeader(sourceWidth, false)}<div class="preview-stage"><iframe title="模块静态预览" sandbox="allow-same-origin"></iframe></div>`;
   const iframe = detail.querySelector("iframe");
   const stage = detail.querySelector(".preview-stage");
-  const objectUrl = URL.createObjectURL(new Blob([previewSource(module)], { type: "text/html;charset=utf-8" }));
+  const objectUrl = URL.createObjectURL(new Blob([previewSource(module, capturedCss)], { type: "text/html;charset=utf-8" }));
   const state = { kind: "original", iframe, stage, targetWidth: sourceWidth, observer: null, restoredCount: 0, objectUrl };
   previewStates.set(detail, state);
   state.observer = new ResizeObserver(() => resizePreview(detail));
@@ -1240,11 +1269,12 @@ testModelSettingsButton.addEventListener("click", async () => {
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || "连接测试失败");
     renderModelSuggestions(data.models || []);
-    if (!aiModelInput.value.trim() && data.models?.length) aiModelInput.value = data.models[0];
     const selectedModel = aiModelInput.value.trim();
-    const selectedAvailable = data.models?.length ? data.models.includes(selectedModel) : data.modelAvailable;
-    const state = selectedAvailable === false ? "checking" : "success";
-    const message = selectedAvailable === false
+    const selectedAvailable = data.models?.length && selectedModel ? data.models.includes(selectedModel) : data.modelAvailable;
+    const state = data.models?.length && !selectedModel ? "success" : selectedAvailable === false ? "checking" : "success";
+    const message = data.models?.length && !selectedModel
+      ? `连接成功，已读取 ${data.models.length} 个模型，请从下拉框选择`
+      : selectedAvailable === false
       ? `API 连接成功，但模型列表中没有 ${selectedModel}`
       : (data.models?.length ? `连接成功，已读取 ${data.models.length} 个可用模型` : data.message);
     setModelSettingsStatus(message, state);
@@ -1253,6 +1283,17 @@ testModelSettingsButton.addEventListener("click", async () => {
   } finally {
     setModelSettingsBusy(false);
   }
+});
+
+modelResultsSelect.addEventListener("change", () => {
+  if (!modelResultsSelect.value) return;
+  aiModelInput.value = modelResultsSelect.value;
+  setModelSettingsStatus(`已选择模型 ${modelResultsSelect.value}，点击“保存配置”后生效`, "success");
+});
+
+aiModelInput.addEventListener("input", () => {
+  const hasOption = Array.from(modelResultsSelect.options).some((option) => option.value === aiModelInput.value.trim());
+  modelResultsSelect.value = hasOption ? aiModelInput.value.trim() : "";
 });
 
 modelSettingsForm.addEventListener("submit", async (event) => {
