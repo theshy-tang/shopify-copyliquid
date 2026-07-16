@@ -62,6 +62,15 @@ const faqModuleFixture = {
   html: '<section class="collapsible-content"><details><summary>Can I use it daily?</summary><div class="accordion__content">Yes, use a small amount once or twice daily.</div></details><details><summary>Is it suitable for sensitive skin?</summary><div class="accordion__content">Patch test first and stop use if irritation occurs.</div></details></section>'
 };
 
+const timelineModuleFixture = {
+  index: 9,
+  tag: "section",
+  id: "timeline",
+  heading: "What Skin Changes Can You Expect With Regular Use of This Tallow Facial Balm?",
+  originalSize: { width: 1440, height: 818 },
+  html: '<section class="timeline-section"><div class="page-width"><h2>What Skin Changes Can You Expect With Regular Use of This Tallow Facial Balm?</h2><ol class="timeline"><li><strong>1 WEEK</strong><p>The tallow base carries vitamins A, D, E and K deep into skin layers, so you will quickly notice a softer, more hydrated complexion within one week of application.</p></li><li><strong>1 MONTH</strong><p>Most users find their skin tone grows more balanced while fine lines start to fade visibly.</p></li></ol></div></section>'
+};
+
 function mediaTextLiquidCode() {
   return `<section id="ai-liquid-media-2"><div class="layout"><div class="media"><img src="https://cdn.example/image.jpg" alt="Product ingredients"></div><div class="copy"><h2>Reveal Softer Skin</h2><p>Rich daily nourishment.</p></div></div></section><style>#ai-liquid-media-2 .layout{display:grid;grid-template-columns:1fr;gap:24px}@media(min-width:750px){#ai-liquid-media-2 .layout{grid-template-columns:1fr 1fr}}</style>`;
 }
@@ -132,6 +141,21 @@ test("FAQ inventory and audit require complete native disclosure items", () => {
   const goodAudit = auditModuleCustomLiquid(faqLiquidCode(), requirements);
   assert.equal(goodAudit.ok, true);
   assert.equal(goodAudit.checks.faqSemanticCount, 2);
+});
+
+test("page-width modules require a centered desktop shell and safe long-text wrapping", () => {
+  const requirements = extractModuleRequirements(
+    timelineModuleFixture,
+    timelineModuleFixture.html,
+    ".page-width{max-width:140rem;margin:0 auto;padding:0 5rem}"
+  );
+  assert.equal(requirements.centeredContent, true);
+
+  const unbounded = '<section id="ai-liquid-timeline-9"><h2>What Skin Changes Can You Expect With Regular Use of This Tallow Facial Balm?</h2><ol><li><p>A very long result description.</p></li></ol></section><style>#ai-liquid-timeline-9{padding:36px 5rem}</style>';
+  const audit = auditModuleCustomLiquid(unbounded, requirements);
+  assert.equal(audit.ok, false);
+  assert.equal(audit.checks.hasCenteredContentShell, false);
+  assert.equal(audit.checks.hasSafeTextWrapping, false);
 });
 
 test("review inventory finds every unique testimonial card", () => {
@@ -293,6 +317,37 @@ test("FAQ conversion keeps native details and adds a full-height expansion safeg
   assert.match(result.code, /data-ai-faq-expansion/);
   assert.match(result.code, /max-height:none!important/);
   assert.equal(result.moduleAudit.faqOutputCount, 2);
+});
+
+test("conversion deterministically centers bounded modules and wraps long text without another model call", async () => {
+  const requests = [];
+  const modelCode = `<section id="ai-liquid-timeline-9"><h2>What Skin Changes Can You Expect With Regular Use of This Tallow Facial Balm?</h2><ol><li><strong>1 WEEK</strong><p>The tallow base carries vitamins A, D, E and K deep into skin layers, so you will quickly notice a softer, more hydrated complexion within one week of application.</p></li><li><strong>1 MONTH</strong><p>Most users find their skin tone grows more balanced while fine lines start to fade visibly.</p></li></ol></section><style>#ai-liquid-timeline-9{background:#fdfdfd;padding:36px 5rem}</style>`;
+  const fetchImpl = async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ code: modelCode, summary: "generated", warnings: [] }) }, finish_reason: "stop" }],
+      usage: { total_tokens: 20 },
+      model: "deepseek-v4-flash"
+    }), { status: 200 });
+  };
+
+  const result = await convertModuleToCustomLiquid({
+    module: timelineModuleFixture,
+    css: ".page-width{max-width:140rem;margin:0 auto;padding:0 5rem}",
+    sourceUrl: "https://store.example/products/item",
+    replacements: [],
+    namespace: "ai-liquid-timeline-9",
+    env: { DEEPSEEK_API_KEY: "test-key" },
+    fetchImpl
+  });
+
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].messages[1].content, /max-width: 1400px/);
+  assert.match(result.code, /data-ai-layout-safety/);
+  assert.match(result.code, /max-width:1400px;margin-inline:auto/);
+  assert.match(result.code, /overflow-wrap:anywhere/);
+  assert.equal(result.moduleAudit.hasCenteredContentShell, true);
+  assert.equal(result.moduleAudit.hasSafeTextWrapping, true);
 });
 
 test("conversion audits only the selected number of image reviews", async () => {
