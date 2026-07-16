@@ -1,0 +1,18 @@
+{
+  "functions": {
+    "api/index.js": {
+      "maxDuration": 60,
+      "includeFiles": "public/**"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/api/(.*)",
+      "destination": "/api/index.js"
+    },
+    {
+      "source": "/((?!app\\.js|styles\\.css|favicon\\.ico).*)",
+      "destination": "/api/index.js"
+    }
+  ]
+}

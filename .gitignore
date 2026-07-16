@@ -1,4 +1,5 @@
 node_modules/
+.vercel/
 .env
 .ai-config.json
 .server.pid
@@ -6,3 +7,5 @@ node_modules/
 fixed-review-custom-liquid.liquid
 verify-*.png
 npm-debug.log*
+
+.vercel

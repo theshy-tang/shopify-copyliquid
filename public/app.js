@@ -1247,12 +1247,16 @@ async function generateLiquid(module, { signal, reveal = true } = {}) {
   syncModuleCard(module.index);
 
   try {
+    const css = await loadModuleCss(module);
     const response = await fetch("/api/convert", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         extractionId: extraction.extractionId,
         moduleIndex: module.index,
+        sourceUrl: extraction.url,
+        module,
+        css,
         reviewLimit: selectedReviewLimit(module),
         replacements: collectReplacements(),
         imageReplacements: moduleImageReplacementList(module.index)
@@ -1308,7 +1312,8 @@ async function generateSelectedModules() {
 
   const fatalCodes = new Set([
     "DEEPSEEK_NOT_CONFIGURED", "DEEPSEEK_AUTH_FAILED", "DEEPSEEK_BALANCE_EMPTY",
-    "DEEPSEEK_RATE_LIMITED", "DEEPSEEK_OVERLOADED", "DEEPSEEK_SERVER_ERROR"
+    "DEEPSEEK_RATE_LIMITED", "DEEPSEEK_OVERLOADED", "DEEPSEEK_SERVER_ERROR",
+    "EXTRACTION_EXPIRED"
   ]);
 
   for (const module of pending) {

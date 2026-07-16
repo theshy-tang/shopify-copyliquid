@@ -10,6 +10,7 @@
     "test": "node --check server.js && node --check public/app.js && node --check lib/custom-liquid.js && node --test"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^149.0.0",
     "cheerio": "^1.2.0",
     "dotenv": "^17.4.2",
     "express": "^5.1.0",

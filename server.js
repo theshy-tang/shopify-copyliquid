@@ -6,7 +6,8 @@ import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import express from "express";
-import { chromium } from "playwright-core";
+import serverlessChromium from "@sparticuz/chromium";
+import { chromium as playwrightChromium } from "playwright-core";
 import { aiSettingsEnvironment, normalizeAiSettings, publicAiSettings } from "./lib/ai-settings.js";
 import {
   ConversionError,
@@ -18,16 +19,17 @@ import {
 } from "./lib/custom-liquid.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const isVercelRuntime = process.env.VERCEL === "1";
 const app = express();
 const port = Number(process.env.PORT || 4173);
 const chromePath = process.env.CHROME_PATH || "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const sourceViewport = { width: 1440, height: 1000 };
 const extractionSessions = new Map();
-const extractionTtlMs = 30 * 60 * 1000;
+const extractionTtlMs = Number(process.env.EXTRACTION_TTL_MS || 4 * 60 * 60 * 1000);
 const maxExtractionSessions = 20;
 const maxCapturedCssBytes = 1_500_000;
 const maxSingleStylesheetBytes = 500_000;
-const aiConfigPath = path.join(__dirname, ".ai-config.json");
+const aiConfigPath = path.join(isVercelRuntime ? "/tmp" : __dirname, ".ai-config.json");
 
 function loadManualAiSettings() {
   try {
@@ -58,13 +60,13 @@ function settingsFromRequest(body) {
   return normalizeAiSettings(body, effectiveAiConfig());
 }
 
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "6mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 function pruneExtractionSessions() {
   const now = Date.now();
   for (const [id, session] of extractionSessions) {
-    if (now - session.createdAt > extractionTtlMs) extractionSessions.delete(id);
+    if (now - (session.accessedAt || session.createdAt) > extractionTtlMs) extractionSessions.delete(id);
   }
   while (extractionSessions.size > maxExtractionSessions) {
     extractionSessions.delete(extractionSessions.keys().next().value);
@@ -72,6 +74,29 @@ function pruneExtractionSessions() {
 }
 
 setInterval(pruneExtractionSessions, 5 * 60 * 1000).unref();
+
+function touchExtractionSession(session) {
+  if (session) session.accessedAt = Date.now();
+  return session;
+}
+
+function fallbackModuleFromRequest(body, moduleIndex) {
+  const input = body?.module;
+  if (!input || typeof input !== "object") return null;
+  const html = String(input.html || "");
+  if (!html || Buffer.byteLength(html, "utf8") > 1_500_000) return null;
+  return {
+    index: Number(input.index) || moduleIndex,
+    tag: String(input.tag || "section").slice(0, 40),
+    id: String(input.id || "").slice(0, 240),
+    classes: Array.isArray(input.classes) ? input.classes.map((item) => String(item).slice(0, 160)).slice(0, 80) : [],
+    heading: String(input.heading || "").slice(0, 500),
+    shopifySection: Boolean(input.shopifySection),
+    originalSize: input.originalSize && typeof input.originalSize === "object" ? input.originalSize : null,
+    html,
+    size: Buffer.byteLength(html, "utf8")
+  };
+}
 
 function isPrivateAddress(address) {
   if (net.isIPv4(address)) {
@@ -108,12 +133,23 @@ function formatBytes(bytes) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+async function launchBrowser() {
+  if (isVercelRuntime) {
+    return playwrightChromium.launch({
+      args: serverlessChromium.args,
+      executablePath: await serverlessChromium.executablePath(),
+      headless: serverlessChromium.headless
+    });
+  }
+  return playwrightChromium.launch({ executablePath: chromePath, headless: true });
+}
+
 app.post("/api/extract", async (req, res) => {
   const startedAt = Date.now();
   let browser;
   try {
     const targetUrl = await validatePublicUrl(String(req.body?.url || "").trim());
-    browser = await chromium.launch({ executablePath: chromePath, headless: true });
+    browser = await launchBrowser();
     const context = await browser.newContext({
       viewport: sourceViewport,
       userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36"
@@ -372,11 +408,12 @@ app.post("/api/extract", async (req, res) => {
     const extractionId = randomUUID();
     extractionSessions.set(extractionId, {
       createdAt: Date.now(),
+      accessedAt: Date.now(),
       url: finalUrl,
       modules: result.modules
     });
     pruneExtractionSessions();
-    const publicModules = result.modules.map(({ css: _css, ...module }) => {
+    const publicModules = result.modules.map((module) => {
       const reviewInventory = extractReviewInventory(module.html);
       return {
         ...module,
@@ -411,7 +448,7 @@ app.get("/api/extract/:extractionId/module/:moduleIndex/css", (req, res) => {
   pruneExtractionSessions();
   const extractionId = String(req.params.extractionId || "").trim();
   const moduleIndex = Number(req.params.moduleIndex);
-  const session = extractionSessions.get(extractionId);
+  const session = touchExtractionSession(extractionSessions.get(extractionId));
   if (!session) return res.status(410).json({ error: "EXTRACTION_EXPIRED" });
   const module = session.modules.find((item) => item.index === moduleIndex);
   if (!module) return res.status(404).json({ error: "MODULE_NOT_FOUND" });
@@ -497,15 +534,16 @@ app.post("/api/convert", async (req, res) => {
     pruneExtractionSessions();
     const extractionId = String(req.body?.extractionId || "").trim();
     const moduleIndex = Number(req.body?.moduleIndex);
-    const session = extractionSessions.get(extractionId);
-    if (!session) {
+    const session = touchExtractionSession(extractionSessions.get(extractionId));
+    const fallbackModule = fallbackModuleFromRequest(req.body, moduleIndex);
+    if (!session && !fallbackModule) {
       throw new ConversionError("提取结果已经过期，请重新提取产品页面", {
         code: "EXTRACTION_EXPIRED",
         status: 410,
         retryable: false
       });
     }
-    const module = session.modules.find((item) => item.index === moduleIndex);
+    const module = session?.modules.find((item) => item.index === moduleIndex) || fallbackModule;
     if (!module) {
       throw new ConversionError("没有找到要转换的模块，请重新提取页面", {
         code: "MODULE_NOT_FOUND",
@@ -514,17 +552,18 @@ app.post("/api/convert", async (req, res) => {
       });
     }
     const imageReplacements = normalizeImageReplacements(req.body?.imageReplacements);
+    const sourceCss = session ? module.css : String(req.body?.css || "");
     const moduleForConversion = imageReplacements.length
       ? { ...module, html: applyImageReplacementsToText(module.html, imageReplacements) }
       : module;
     const cssForConversion = imageReplacements.length
-      ? applyImageReplacementsToText(module.css, imageReplacements)
-      : module.css;
+      ? applyImageReplacementsToText(sourceCss, imageReplacements)
+      : sourceCss;
     const namespace = `ai-liquid-${extractionId.replace(/-/g, "").slice(0, 10)}-${module.index}`;
     const result = await convertModuleToCustomLiquid({
       module: moduleForConversion,
       css: cssForConversion,
-      sourceUrl: session.url,
+      sourceUrl: session?.url || String(req.body?.sourceUrl || ""),
       replacements: req.body?.replacements,
       reviewLimit: req.body?.reviewLimit,
       namespace,
@@ -559,6 +598,10 @@ app.get("/api/health", (_req, res) => {
   });
 });
 
-app.listen(port, () => {
-  console.log(`Shopify module copier: http://localhost:${port}`);
-});
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  app.listen(port, () => {
+    console.log(`Shopify module copier: http://localhost:${port}`);
+  });
+}
+
+export default app;
