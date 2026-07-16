@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   ConversionError,
+  applyImageReplacementsToText,
   applyTextReplacements,
   auditModuleCustomLiquid,
   auditReviewCustomLiquid,
@@ -12,6 +13,7 @@ import {
   extractReviewInventory,
   getDeepSeekConfig,
   limitImageReviewSource,
+  normalizeImageReplacements,
   optimizeReviewSourceForAi,
   parseDeepSeekResult,
   validateCustomLiquid
@@ -106,6 +108,18 @@ test("global replacements change visible text and content attributes but not scr
   assert.match(result.html, /alt="New Product"/);
   assert.match(result.html, /const label = "Original Product"/);
   assert.equal(result.counts[0].count, 2);
+});
+
+test("image replacements update HTML and CSS URLs while rejecting unsafe targets", () => {
+  const replacements = normalizeImageReplacements([
+    { from: "https://cdn.example.com/old.jpg", to: "https://cdn.example.com/new.webp" },
+    { from: "https://cdn.example.com/blocked.jpg", to: "javascript:alert(1)" }
+  ]);
+  assert.deepEqual(replacements, [{ from: "https://cdn.example.com/old.jpg", to: "https://cdn.example.com/new.webp" }]);
+  const source = '<img src="https://cdn.example.com/old.jpg" srcset="https://cdn.example.com/old.jpg 800w"><style>.x{background:url(https://cdn.example.com/old.jpg)}</style>';
+  const updated = applyImageReplacementsToText(source, replacements);
+  assert.equal(updated.includes("https://cdn.example.com/old.jpg"), false);
+  assert.equal((updated.match(/https:\/\/cdn\.example\.com\/new\.webp/g) || []).length, 3);
 });
 
 test("media and text modules require desktop columns and a mobile stack", () => {

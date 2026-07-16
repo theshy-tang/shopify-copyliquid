@@ -45,6 +45,15 @@ const modelResultsSelect = document.querySelector("#ai-model-results");
 const aiThinkingInput = document.querySelector("#ai-thinking");
 const aiTimeoutInput = document.querySelector("#ai-timeout");
 const aiMaxTokensInput = document.querySelector("#ai-max-tokens");
+const imageReplacementDialog = document.querySelector("#image-replacement-dialog");
+const imageReplacementTitle = document.querySelector("#image-replacement-title");
+const imageReplacementCount = document.querySelector("#image-replacement-count");
+const imageReplacementSubtitle = document.querySelector("#image-replacement-subtitle");
+const imageReplacementList = document.querySelector("#image-replacement-list");
+const imageReplacementEmpty = document.querySelector("#image-replacement-empty");
+const closeImageReplacementButton = document.querySelector("#close-image-replacement");
+const clearImageReplacementsButton = document.querySelector("#clear-image-replacements");
+const applyImageReplacementsButton = document.querySelector("#apply-image-replacements");
 
 let extraction = null;
 let aiConfig = { configured: false, provider: "deepseek", model: "deepseek-v4-flash", checking: true, mock: false };
@@ -58,10 +67,13 @@ let liquidGroupState = { signature: "", groups: [] };
 const includedModules = new Set();
 const liquidResults = new Map();
 const reviewLimits = new Map();
+const imageReplacements = new Map();
 const replacementCorpusCache = new Map();
 const previewStates = new WeakMap();
 const liquidPreviewBridges = new Map();
 const moduleCssCache = new Map();
+let activeImageModuleIndex = null;
+let activeImageItems = [];
 const SHOPIFY_CUSTOM_LIQUID_SAFE_BYTES = 49_000;
 
 const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, (char) => ({
@@ -199,6 +211,258 @@ function downloadText(text, filename, type = "text/plain;charset=utf-8") {
   link.download = filename;
   link.click();
   URL.revokeObjectURL(link.href);
+}
+
+function normalizeImageUrl(value) {
+  const url = String(value || "").trim();
+  if (!url || url.startsWith("#") || /^(?:data|blob|javascript):/i.test(url)) return "";
+  return url;
+}
+
+function isLikelyImageUrl(value) {
+  const url = normalizeImageUrl(value);
+  if (!url) return false;
+  if (/\.(?:avif|gif|jpe?g|png|svg|webp|ico)(?:[?#]|$)/i.test(url)) return true;
+  if (/(?:cdn\.shopify\.com|\/cdn\/shop\/|\/files\/|\/products\/|image|img|photo|picture|media)/i.test(url)) return true;
+  return !/\.(?:css|js|mjs|woff2?|ttf|otf|eot|json)(?:[?#]|$)/i.test(url);
+}
+
+function isRelativeDecorationImageUrl(value) {
+  const url = normalizeImageUrl(value);
+  return /^(?:\.{1,2}\/|[^/:?#]+\/|[^/:?#]+\.(?:gif|svg|png|jpe?g|webp|avif|ico)(?:[?#]|$))/i.test(url) &&
+    !/^(?:https?:)?\/\//i.test(url) &&
+    !/^(?:\/cdn\/|\/files\/|\/products\/)/i.test(url);
+}
+
+function srcsetUrls(value) {
+  return String(value || "").split(",")
+    .map((part) => normalizeImageUrl(part.trim().split(/\s+/)[0]))
+    .filter(Boolean);
+}
+
+function srcsetEntries(value) {
+  return String(value || "").split(",").map((part) => {
+    const bits = part.trim().split(/\s+/);
+    const url = normalizeImageUrl(bits[0]);
+    const descriptorWidth = Number.parseInt(String(bits[1] || "").replace(/w$/i, ""), 10);
+    return { url, descriptorWidth: Number.isFinite(descriptorWidth) ? descriptorWidth : 0 };
+  }).filter((entry) => entry.url);
+}
+
+function imageVariantInfo(value, descriptorWidth = 0) {
+  const original = normalizeImageUrl(value);
+  const fallback = { key: original, width: descriptorWidth || 0 };
+  try {
+    const url = new URL(original, extraction?.url || window.location.href);
+    const queryWidth = Number.parseInt(url.searchParams.get("width") || url.searchParams.get("w") || "", 10);
+    const pathWidth = Number.parseInt(url.pathname.match(/[_-](\d{2,5})x(?:\d{2,5})?(?=\.[a-z0-9]+$)/i)?.[1] || "", 10);
+    const width = [descriptorWidth, queryWidth, pathWidth].filter(Number.isFinite).reduce((max, item) => Math.max(max, item || 0), 0);
+    ["width", "w", "height", "h"].forEach((name) => url.searchParams.delete(name));
+    url.pathname = url.pathname.replace(/([_-])\d{2,5}x(?:\d{2,5})?(?=\.[a-z0-9]+$)/i, "");
+    return { key: url.href, width };
+  } catch {
+    return fallback;
+  }
+}
+
+function urlsFromCssText(value) {
+  const urls = [];
+  String(value || "").replace(/url\((['"]?)(.*?)\1\)/gi, (_match, _quote, url) => {
+    const normalized = normalizeImageUrl(url);
+    if (normalized && !isRelativeDecorationImageUrl(normalized) && isLikelyImageUrl(normalized)) urls.push(normalized);
+    return _match;
+  });
+  return urls;
+}
+
+function pushImageItem(items, seen, url, source, descriptorWidth = 0) {
+  const normalized = normalizeImageUrl(url);
+  if (!normalized || !isLikelyImageUrl(normalized)) return;
+  const variant = imageVariantInfo(normalized, descriptorWidth);
+  if (seen.has(variant.key)) {
+    const existing = items[seen.get(variant.key)];
+    if (!existing.sources.includes(source)) existing.sources.push(source);
+    if (!existing.variants.includes(normalized)) existing.variants.push(normalized);
+    if ((variant.width || 0) > (existing.width || 0)) {
+      existing.url = normalized;
+      existing.width = variant.width;
+    }
+    return;
+  }
+  seen.set(variant.key, items.length);
+  items.push({
+    key: `image-${items.length + 1}`,
+    url: normalized,
+    width: variant.width,
+    variants: [normalized],
+    sources: [source]
+  });
+}
+
+function collectImageLinks(module, css = "") {
+  const items = [];
+  const seen = new Map();
+  const template = document.createElement("template");
+  template.innerHTML = module.html || "";
+  const directAttributes = ["src", "poster", "data-src", "data-bg", "data-background-image"];
+  const srcsetAttributes = ["srcset", "data-srcset"];
+
+  template.content.querySelectorAll("*").forEach((node) => {
+    const tag = node.tagName.toLowerCase();
+    directAttributes.forEach((attribute) => {
+      const value = node.getAttribute(attribute);
+      if (value) pushImageItem(items, seen, value, `${tag}[${attribute}]`);
+    });
+    srcsetAttributes.forEach((attribute) => {
+      srcsetEntries(node.getAttribute(attribute)).forEach((entry) => pushImageItem(items, seen, entry.url, `${tag}[${attribute}]`, entry.descriptorWidth));
+    });
+    urlsFromCssText(node.getAttribute("style")).forEach((url) => pushImageItem(items, seen, url, `${tag}[style]`));
+  });
+
+  urlsFromCssText(css).forEach((url) => pushImageItem(items, seen, url, "captured CSS"));
+  return items;
+}
+
+function moduleImageReplacementList(index) {
+  return imageReplacements.get(index) || [];
+}
+
+function applyImageReplacementsToText(value, replacements) {
+  return moduleImageReplacementList(-1).concat(replacements || []).reduce((current, replacement) => {
+    if (!replacement?.from || !replacement?.to || !current.includes(replacement.from)) return current;
+    return current.split(replacement.from).join(replacement.to);
+  }, String(value || ""));
+}
+
+function applyImageReplacementsForModule(value, module) {
+  return applyImageReplacementsToText(value, moduleImageReplacementList(module.index));
+}
+
+function effectiveModuleCss(module, css) {
+  return applyImageReplacementsForModule(css, module);
+}
+
+function validReplacementTarget(value) {
+  try {
+    const url = new URL(String(value || "").trim());
+    return ["http:", "https:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+}
+
+function imageIcon() {
+  return '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8" cy="10" r="1.6"/><path d="M21 16l-5.2-5.2a1.3 1.3 0 0 0-1.8 0L7 18"/></svg>';
+}
+
+function markModuleLiquidStale(index, reason) {
+  const result = liquidResults.get(index);
+  if (result?.code) liquidResults.set(index, { ...result, stale: true, staleReason: reason });
+  syncModuleCard(index);
+  updateBatchControls();
+}
+
+function imageReplacementRowMarkup(item, index) {
+  const number = String(index + 1).padStart(2, "0");
+  const sourceLabel = item.sources.slice(0, 2).join("，");
+  const more = item.sources.length > 2 ? ` 等 ${item.sources.length} 处` : "";
+  const variantLabel = item.variants?.length > 1 ? `，已合并 ${item.variants.length} 个尺寸` : "";
+  return `<article class="image-replacement-row" data-image-index="${index}">
+    <div class="image-thumb">
+      <img src="${escapeHtml(item.url)}" alt="图片 ${number} 预览" loading="lazy">
+      <span>${number}</span>
+    </div>
+    <div class="image-replacement-fields">
+      <div class="image-row-title">
+        <strong>图片 ${number}</strong>
+        <span>${escapeHtml(sourceLabel + more + variantLabel)}</span>
+      </div>
+      <label class="settings-field">
+        <span>当前链接</span>
+        <span class="image-url-line">
+          <input type="text" value="${escapeHtml(item.url)}" readonly spellcheck="false">
+          <a href="${escapeHtml(item.url)}" class="secondary image-open-link" target="_blank" rel="noopener noreferrer">打开</a>
+        </span>
+      </label>
+      <label class="settings-field">
+        <span>替换为</span>
+        <span class="image-url-line">
+          <input type="url" data-image-new-url placeholder="粘贴新的图片链接，留空则不替换" spellcheck="false">
+          <a class="secondary image-open-link" data-image-new-open target="_blank" rel="noopener noreferrer" aria-disabled="true">预览</a>
+        </span>
+      </label>
+    </div>
+  </article>`;
+}
+
+function updateImageReplacementActions() {
+  const rows = Array.from(imageReplacementList.querySelectorAll("[data-image-index]"));
+  const hasValidChange = rows.some((row) => {
+    const item = activeImageItems[Number(row.dataset.imageIndex)];
+    const value = row.querySelector("[data-image-new-url]")?.value.trim() || "";
+    return value && value !== item?.url && validReplacementTarget(value);
+  });
+  applyImageReplacementsButton.disabled = !hasValidChange;
+}
+
+function renderImageReplacementRows() {
+  imageReplacementCount.textContent = activeImageItems.length ? `${activeImageItems.length} 张图片` : "无图片";
+  imageReplacementList.innerHTML = activeImageItems.map(imageReplacementRowMarkup).join("");
+  imageReplacementEmpty.hidden = activeImageItems.length > 0;
+  updateImageReplacementActions();
+}
+
+async function openImageReplacementDrawer(module) {
+  activeImageModuleIndex = module.index;
+  activeImageItems = [];
+  imageReplacementTitle.textContent = `模块 ${String(module.index).padStart(2, "0")} 图片替换`;
+  imageReplacementCount.textContent = "读取中";
+  imageReplacementSubtitle.textContent = module.heading || module.id || `${module.tag} 模块`;
+  imageReplacementList.innerHTML = '<div class="image-replacement-loading">正在读取模块图片链接</div>';
+  imageReplacementEmpty.hidden = true;
+  applyImageReplacementsButton.disabled = true;
+  if (!imageReplacementDialog.open) imageReplacementDialog.showModal();
+
+  const css = await loadModuleCss(module);
+  if (activeImageModuleIndex !== module.index) return;
+  activeImageItems = collectImageLinks(module, effectiveModuleCss(module, css));
+  renderImageReplacementRows();
+}
+
+function refreshModuleAfterImageReplacement(module) {
+  replacementCorpusCache.delete(module.index);
+  updateReplacementCounts();
+  const card = moduleList.querySelector(`.module-card[data-index="${module.index}"]`);
+  if (!card) return;
+  const size = card.querySelector(".module-size");
+  if (size) size.textContent = `${(module.size / 1024).toFixed(1)} KB`;
+  const detail = card.querySelector(".module-detail");
+  if (detail?.dataset.mode === "preview") mountOriginalPreview(detail, module);
+  if (detail?.dataset.mode === "source") detail.innerHTML = `<pre><code>${escapeHtml(cleanModuleHtml(module.html))}</code></pre>`;
+}
+
+function applyImageReplacementInputs() {
+  const module = extraction?.modules.find((item) => item.index === activeImageModuleIndex);
+  if (!module) return;
+  const next = [];
+  imageReplacementList.querySelectorAll("[data-image-index]").forEach((row) => {
+    const item = activeImageItems[Number(row.dataset.imageIndex)];
+    const target = row.querySelector("[data-image-new-url]")?.value.trim() || "";
+    if (item?.url && target && target !== item.url && validReplacementTarget(target)) {
+      (item.variants?.length ? item.variants : [item.url]).forEach((from) => {
+        if (from && from !== target) next.push({ from, to: target });
+      });
+    }
+  });
+  if (!next.length) return;
+  const current = moduleImageReplacementList(module.index);
+  imageReplacements.set(module.index, [...current, ...next]);
+  module.html = applyImageReplacementsToText(module.html, next);
+  module.size = new Blob([module.html]).size;
+  markModuleLiquidStale(module.index, "image-replacement");
+  refreshModuleAfterImageReplacement(module);
+  showToast(`模块 ${module.index} 已替换 ${next.length} 张图片`);
+  imageReplacementDialog.close();
 }
 
 function attributesMarkup(attributes = {}) {
@@ -487,7 +751,7 @@ async function mountOriginalPreview(detail, module) {
   detail.innerHTML = `${previewHeader(sourceWidth, false)}<div class="preview-stage"><iframe title="模块静态预览" sandbox="allow-same-origin"></iframe></div>`;
   const iframe = detail.querySelector("iframe");
   const stage = detail.querySelector(".preview-stage");
-  const objectUrl = URL.createObjectURL(new Blob([previewSource(module, capturedCss)], { type: "text/html;charset=utf-8" }));
+  const objectUrl = URL.createObjectURL(new Blob([previewSource(module, effectiveModuleCss(module, capturedCss))], { type: "text/html;charset=utf-8" }));
   const state = { kind: "original", iframe, stage, targetWidth: sourceWidth, observer: null, restoredCount: 0, objectUrl };
   previewStates.set(detail, state);
   state.observer = new ResizeObserver(() => resizePreview(detail));
@@ -674,6 +938,8 @@ function liquidStatusMarkup(index) {
   if (result.code && result.stale) {
     const message = result.staleReason === "review-limit"
       ? "评论生成数量已改变，需要重新生成"
+      : result.staleReason === "image-replacement"
+        ? "图片链接已替换，需要重新生成"
       : "全局替换已改变，需要重新生成";
     return `<span class="status-dot"></span><span>${message}</span>`;
   }
@@ -928,6 +1194,7 @@ function renderModules(query = "") {
         </div>
         <div class="module-meta">
           <span class="module-size">${(module.size / 1024).toFixed(1)} KB</span>
+          <button type="button" class="image-replace-toggle" data-action="replace-images" aria-label="替换模块 ${module.index} 的图片" title="替换图片">${imageIcon()}</button>
           <button type="button" class="visibility-toggle" data-action="toggle-inclusion" aria-pressed="${included}" aria-label="${included ? `排除模块 ${module.index}` : `恢复模块 ${module.index}`}">${eyeIcon(included)}</button>
         </div>
       </div>
@@ -987,7 +1254,8 @@ async function generateLiquid(module, { signal, reveal = true } = {}) {
         extractionId: extraction.extractionId,
         moduleIndex: module.index,
         reviewLimit: selectedReviewLimit(module),
-        replacements: collectReplacements()
+        replacements: collectReplacements(),
+        imageReplacements: moduleImageReplacementList(module.index)
       }),
       signal
     });
@@ -1119,6 +1387,7 @@ moduleList.addEventListener("click", async (event) => {
   const action = button.dataset.action;
 
   if (action === "toggle-inclusion") return toggleModuleInclusion(card, module);
+  if (action === "replace-images") return openImageReplacementDrawer(module);
   if (action === "preview" || action === "source" || action === "liquid-preview" || action === "liquid-code") return showModuleView(card, module, action);
   if (action === "generate-liquid" || action === "retry-liquid") return generateLiquid(module);
   if (action === "copy-liquid") {
@@ -1152,6 +1421,38 @@ moduleList.addEventListener("click", async (event) => {
     showActionFeedback(button, "已开始下载");
   }
 });
+
+imageReplacementList.addEventListener("input", (event) => {
+  const input = event.target.closest("[data-image-new-url]");
+  if (!input) return;
+  const row = input.closest("[data-image-index]");
+  const item = activeImageItems[Number(row.dataset.imageIndex)];
+  const value = input.value.trim();
+  const thumb = row.querySelector(".image-thumb img");
+  const previewLink = row.querySelector("[data-image-new-open]");
+  const canPreview = value && validReplacementTarget(value);
+  thumb.src = canPreview ? value : item.url;
+  previewLink.href = canPreview ? value : "";
+  previewLink.setAttribute("aria-disabled", String(!canPreview));
+  previewLink.classList.toggle("is-disabled", !canPreview);
+  updateImageReplacementActions();
+});
+
+imageReplacementList.addEventListener("click", (event) => {
+  const disabledPreview = event.target.closest("[data-image-new-open][aria-disabled='true']");
+  if (disabledPreview) event.preventDefault();
+});
+
+closeImageReplacementButton.addEventListener("click", () => imageReplacementDialog.close());
+
+clearImageReplacementsButton.addEventListener("click", () => {
+  imageReplacementList.querySelectorAll("[data-image-new-url]").forEach((input) => {
+    input.value = "";
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+});
+
+applyImageReplacementsButton.addEventListener("click", applyImageReplacementInputs);
 
 replacementList.addEventListener("input", (event) => {
   const input = event.target.closest("[data-replacement-field]");
@@ -1391,6 +1692,7 @@ form.addEventListener("submit", async (event) => {
     includedModules.clear();
     data.modules.forEach((module) => includedModules.add(module.index));
     liquidResults.clear();
+    imageReplacements.clear();
     liquidGroupSize = 5;
     liquidGroupState = { signature: "", groups: [] };
     reviewLimits.clear();

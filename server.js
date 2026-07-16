@@ -8,7 +8,14 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import { chromium } from "playwright-core";
 import { aiSettingsEnvironment, normalizeAiSettings, publicAiSettings } from "./lib/ai-settings.js";
-import { ConversionError, convertModuleToCustomLiquid, extractReviewInventory, getDeepSeekConfig } from "./lib/custom-liquid.js";
+import {
+  ConversionError,
+  applyImageReplacementsToText,
+  convertModuleToCustomLiquid,
+  extractReviewInventory,
+  getDeepSeekConfig,
+  normalizeImageReplacements
+} from "./lib/custom-liquid.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -506,10 +513,17 @@ app.post("/api/convert", async (req, res) => {
         retryable: false
       });
     }
+    const imageReplacements = normalizeImageReplacements(req.body?.imageReplacements);
+    const moduleForConversion = imageReplacements.length
+      ? { ...module, html: applyImageReplacementsToText(module.html, imageReplacements) }
+      : module;
+    const cssForConversion = imageReplacements.length
+      ? applyImageReplacementsToText(module.css, imageReplacements)
+      : module.css;
     const namespace = `ai-liquid-${extractionId.replace(/-/g, "").slice(0, 10)}-${module.index}`;
     const result = await convertModuleToCustomLiquid({
-      module,
-      css: module.css,
+      module: moduleForConversion,
+      css: cssForConversion,
       sourceUrl: session.url,
       replacements: req.body?.replacements,
       reviewLimit: req.body?.reviewLimit,

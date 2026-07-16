@@ -209,6 +209,38 @@
     </div>
   </dialog>
 
+  <dialog id="image-replacement-dialog" class="settings-drawer image-replacement-drawer" aria-labelledby="image-replacement-title">
+    <div class="settings-drawer-shell">
+      <header class="settings-drawer-head">
+        <div>
+          <div class="settings-title-line">
+            <h2 id="image-replacement-title">图片替换</h2>
+            <span id="image-replacement-count" class="settings-source">读取中</span>
+          </div>
+          <p id="image-replacement-subtitle">按模块内图片出现顺序列出链接，替换后会用于预览、源码复制和 Liquid 生成。</p>
+        </div>
+        <button id="close-image-replacement" class="settings-close" type="button" aria-label="关闭图片替换">×</button>
+      </header>
+
+      <div class="settings-form image-replacement-form">
+        <div class="settings-form-body">
+          <div id="image-replacement-list" class="image-replacement-list"></div>
+          <div id="image-replacement-empty" class="image-replacement-empty" hidden>
+            <h3>没有发现图片链接</h3>
+            <p>这个模块的图片可能由来源主题脚本或远程 CSS 注入，当前静态模块里没有可替换的图片地址。</p>
+          </div>
+        </div>
+
+        <footer class="settings-drawer-foot">
+          <button id="clear-image-replacements" class="settings-text-button" type="button">清空输入</button>
+          <div>
+            <button id="apply-image-replacements" class="ai-primary" type="button" disabled>应用替换</button>
+          </div>
+        </footer>
+      </div>
+    </div>
+  </dialog>
+
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script type="module" src="/app.js"></script>
 </body>
