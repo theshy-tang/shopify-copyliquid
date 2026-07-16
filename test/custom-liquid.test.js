@@ -407,6 +407,26 @@ test("AI JSON output is parsed and Markdown fences are removed", () => {
   assert.equal(result.summary, "已生成");
 });
 
+test("AI JSON output can be recovered from explanatory Markdown responses", () => {
+  const payload = JSON.stringify({
+    code: "<div id=\"ai-liquid-test-3\">Ready</div>",
+    summary: "已生成",
+    warnings: []
+  });
+  const result = parseDeepSeekResult(`Here is the result:\n\n\`\`\`json\n${payload}\n\`\`\``, "ai-liquid-test-3");
+  assert.equal(result.code, "<div id=\"ai-liquid-test-3\">Ready</div>");
+  assert.equal(result.summary, "已生成");
+});
+
+test("raw Custom Liquid output is accepted when a model ignores the JSON contract", () => {
+  const result = parseDeepSeekResult(
+    "```liquid\n<div id=\"ai-liquid-test-3\"><p>Ready</p></div>\n<style>#ai-liquid-test-3{display:block}</style>\n```",
+    "ai-liquid-test-3"
+  );
+  assert.match(result.code, /<div id="ai-liquid-test-3">/);
+  assert.match(result.warnings.join(" "), /非 JSON/);
+});
+
 test("oversize Custom Liquid is compacted below Shopify's setting limit without changing scripts", () => {
   const script = "<script>(() => {\n  const label = 'Keep  two  spaces';\n  console.log(label);\n})();</script>";
   const oversized = `<div id="ai-liquid-test-3">\n<style>#ai-liquid-test-3 {${"\n  color: red;                 ".repeat(2200)}\n}</style>\n<p>Keep\n  words separated</p>\n${script}\n</div>`;
@@ -474,6 +494,42 @@ test("New API uses the OpenAI-compatible v1 endpoint and generic reasoning optio
   assert.equal(requestBody.reasoning_effort, "high");
   assert.equal("thinking" in requestBody, false);
   assert.equal(result.model, "gateway-model");
+});
+
+test("New API content parts are normalized before parsing the generated JSON", async () => {
+  const fetchImpl = async () => new Response(JSON.stringify({
+    choices: [{
+      message: {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            code: '<div id="ai-liquid-test-3">Ready</div>',
+            summary: "已生成",
+            warnings: []
+          })
+        }]
+      },
+      finish_reason: "stop"
+    }],
+    usage: { total_tokens: 12 },
+    model: "grok-4.5"
+  }), { status: 200 });
+  const result = await convertModuleToCustomLiquid({
+    module: moduleFixture,
+    css: "",
+    sourceUrl: "https://store.example/products/item",
+    replacements: [],
+    namespace: "ai-liquid-test-3",
+    env: {
+      AI_PROVIDER: "newapi",
+      AI_API_KEY: "newapi-token",
+      AI_BASE_URL: "https://gateway.example.com",
+      AI_MODEL: "grok-4.5"
+    },
+    fetchImpl
+  });
+  assert.match(result.code, /<div id="ai-liquid-test-3">Ready<\/div>/);
+  assert.equal(result.model, "grok-4.5");
 });
 
 test("unsafe generated network scripts are rejected", () => {
