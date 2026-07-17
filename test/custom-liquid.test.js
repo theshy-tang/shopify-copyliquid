@@ -6,6 +6,7 @@ import {
   applyTextReplacements,
   auditModuleCustomLiquid,
   auditReviewCustomLiquid,
+  buildModuleContextPackage,
   compactCustomLiquidCode,
   convertModuleToCustomLiquid,
   extractFaqInventory,
@@ -14,6 +15,7 @@ import {
   getDeepSeekConfig,
   limitImageReviewSource,
   normalizeImageReplacements,
+  optimizeModuleSourceForAi,
   optimizeReviewSourceForAi,
   parseDeepSeekResult,
   validateCustomLiquid
@@ -210,6 +212,55 @@ test("review source optimization removes repeated star SVG paths without losing 
   assert.ok(Buffer.byteLength(optimized, "utf8") < Buffer.byteLength(source, "utf8") / 2);
 });
 
+test("module source optimization strips technical noise while preserving visible content", () => {
+  const noisy = `<section class="shopify-section section huge extra classes that keep growing" data-section-id="abc" x-data="{ open: true }" onclick="track()">
+    <style>.huge{color:red}</style>
+    <script>expensiveThemeCode()</script>
+    <h2 data-block-id="title">Adopt a Ghost Necklace</h2>
+    <img src="https://cdn.example.com/ghost.jpg" srcset="https://cdn.example.com/ghost-small.jpg 360w, https://cdn.example.com/ghost-large.jpg 1200w" alt="Glow ghost pendant">
+    <svg aria-label="sparkle icon"><path d="M0 0L9 9"></path></svg>
+  </section>`;
+  const optimized = optimizeModuleSourceForAi(noisy, { aggressive: true });
+  assert.match(optimized, /Adopt a Ghost Necklace/);
+  assert.match(optimized, /https:\/\/cdn\.example\.com\/ghost\.jpg/);
+  assert.match(optimized, /Glow ghost pendant/);
+  assert.match(optimized, /sparkle icon/);
+  assert.doesNotMatch(optimized, /<script|<style|data-section-id|x-data|onclick|<svg/i);
+  assert.ok(Buffer.byteLength(optimized, "utf8") < Buffer.byteLength(noisy, "utf8") / 2);
+
+  const lazyOptimized = optimizeModuleSourceForAi(
+    `<div><img data-srcset="https://cdn.example.com/lazy-small.jpg 360w, https://cdn.example.com/lazy-large.jpg 1200w" alt="Lazy image"></div>`,
+    { aggressive: true }
+  );
+  assert.match(lazyOptimized, /https:\/\/cdn\.example\.com\/lazy-large\.jpg/);
+  assert.match(lazyOptimized, /Lazy image/);
+  assert.doesNotMatch(lazyOptimized, /data-srcset/);
+});
+
+test("module context package preserves original detail for compact retries", () => {
+  const html = `<section class="media-text" data-section-id="abc">
+    <h2>Adopt a Ghost Necklace</h2>
+    <p>Bring home your tiny ghost companion and let it glow through spooky season.</p>
+    <img src="https://cdn.example.com/ghost.jpg" alt="Glow ghost pendant">
+    <a href="https://example.com/size-guide">Size guide</a>
+  </section>`;
+  const context = buildModuleContextPackage({
+    module: { ...moduleFixture, heading: "Adopt a Ghost Necklace", originalSize: { width: 1440, height: 620 } },
+    html,
+    css: ".media-text{display:grid;grid-template-columns:1fr 1fr;color:#123456;font-family:Inter,sans-serif;gap:32px}",
+    requirements: { mediaText: true, centeredContent: false },
+    reviewInventory: null,
+    compactLevel: 2
+  });
+  assert.match(context.fullText, /tiny ghost companion/);
+  assert.equal(context.images[0].url, "https://cdn.example.com/ghost.jpg");
+  assert.equal(context.images[0].alt, "Glow ghost pendant");
+  assert.equal(context.links[0].text, "Size guide");
+  assert.equal(context.requirements.desktopMediaText, true);
+  assert.ok(context.cssHints.colors.includes("#123456"));
+  assert.ok(context.cssHints.layout.some((item) => /grid-template-columns/i.test(item)));
+});
+
 test("review audit rejects omissions and accepts a complete native carousel", () => {
   const inventory = extractReviewInventory(reviewModuleFixture.html);
   const incomplete = auditReviewCustomLiquid(reviewLiquidCode(reviewItems.slice(0, 2)).replace(/<script>[\s\S]*?<\/script>/, ""), inventory);
@@ -331,6 +382,60 @@ test("FAQ conversion keeps native details and adds a full-height expansion safeg
   assert.match(result.code, /data-ai-faq-expansion/);
   assert.match(result.code, /max-height:none!important/);
   assert.equal(result.moduleAudit.faqOutputCount, 2);
+});
+
+test("compact retry sends a source context package with original details", async () => {
+  const requests = [];
+  const compactModule = {
+    index: 21,
+    tag: "section",
+    id: "ghost-necklace",
+    heading: "Adopt a Ghost Necklace",
+    html: `<section class="shopify-section ghost" data-section-id="abc">
+      <script>themeCarousel()</script>
+      <h2>Adopt a Ghost Necklace</h2>
+      <p>Bring home your tiny ghost companion and let it glow through spooky season.</p>
+      <img src="https://cdn.example.com/ghost.jpg" alt="Glow ghost pendant">
+    </section>`
+  };
+  const fetchImpl = async (_url, init) => {
+    requests.push(JSON.parse(init.body));
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            code: '<section id="ai-liquid-compact-21"><h2>Adopt a Ghost Necklace</h2><p>Bring home your tiny ghost companion and let it glow through spooky season.</p><img src="https://cdn.example.com/ghost.jpg" alt="Glow ghost pendant"></section>',
+            summary: "generated",
+            warnings: []
+          })
+        },
+        finish_reason: "stop"
+      }],
+      usage: { total_tokens: 20 },
+      model: "deepseek-v4-flash"
+    }), { status: 200 });
+  };
+
+  const result = await convertModuleToCustomLiquid({
+    module: compactModule,
+    css: ".ghost{display:grid;grid-template-columns:1fr 1fr;color:#123456}",
+    sourceUrl: "https://store.example/products/ghost",
+    replacements: [],
+    namespace: "ai-liquid-compact-21",
+    env: { DEEPSEEK_API_KEY: "test-key" },
+    fetchImpl,
+    compactMode: true,
+    compactLevel: 2
+  });
+
+  assert.equal(requests.length, 1);
+  assert.match(requests[0].messages[1].content, /<SOURCE_CONTEXT_PACKAGE>/);
+  assert.match(requests[0].messages[1].content, /tiny ghost companion/);
+  assert.match(requests[0].messages[1].content, /https:\/\/cdn\.example\.com\/ghost\.jpg/);
+  assert.equal(result.requestAudit.compactMode, true);
+  assert.equal(result.requestAudit.compactLevel, 2);
+  assert.ok(result.requestAudit.sourceContextBytes > 100);
+  assert.match(result.warnings.join(" "), /上下文包/);
 });
 
 test("conversion deterministically centers bounded modules and wraps long text without another model call", async () => {

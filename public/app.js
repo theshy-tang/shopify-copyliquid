@@ -75,6 +75,16 @@ const moduleCssCache = new Map();
 let activeImageModuleIndex = null;
 let activeImageItems = [];
 const SHOPIFY_CUSTOM_LIQUID_SAFE_BYTES = 49_000;
+const BATCH_GENERATION_CONCURRENCY = 3;
+const BATCH_GENERATION_MAX_RETRIES = 2;
+const FATAL_GENERATION_ERROR_CODES = new Set([
+  "DEEPSEEK_NOT_CONFIGURED",
+  "DEEPSEEK_AUTH_FAILED",
+  "DEEPSEEK_BALANCE_EMPTY",
+  "DEEPSEEK_INVALID_PARAMETERS",
+  "EXTRACTION_EXPIRED",
+  "MODULE_NOT_FOUND"
+]);
 
 const escapeHtml = (value = "") => String(value).replace(/[&<>'"]/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;"
@@ -87,6 +97,24 @@ function showToast(message) {
   toast.classList.add("show");
   clearTimeout(showToast.timer);
   showToast.timer = setTimeout(() => toast.classList.remove("show"), 2400);
+}
+
+async function readJsonResponse(response, fallbackMessage = "请求失败") {
+  const text = await response.text();
+  if (!text) return {};
+  try {
+    return JSON.parse(text);
+  } catch {
+    const snippet = text.replace(/\s+/g, " ").trim().slice(0, 180);
+    const status = response.status ? `HTTP ${response.status}` : "network";
+    const message = response.ok
+      ? `接口返回了非 JSON 响应：${snippet || fallbackMessage}`
+      : `${fallbackMessage}（${status}）：${snippet || response.statusText || "服务器返回了非 JSON 错误"}`;
+    const error = new Error(message);
+    error.status = response.status;
+    error.retryable = response.status >= 500 || response.status === 0;
+    throw error;
+  }
 }
 
 function setModelSettingsStatus(message, state = "") {
@@ -173,7 +201,7 @@ function populateModelSettings(data) {
 async function loadModelSettings() {
   setModelSettingsStatus("正在读取当前配置", "checking");
   const response = await fetch("/api/ai/config");
-  const data = await response.json();
+  const data = await readJsonResponse(response, "无法读取模型配置");
   if (!response.ok) throw new Error(data.error || "无法读取模型配置");
   populateModelSettings(data);
   setModelSettingsStatus(data.configured ? `当前模型：${data.model}` : "当前没有可用的 API Key");
@@ -537,7 +565,7 @@ async function loadModuleCss(module) {
   const request = fetch(`/api/extract/${encodeURIComponent(extractionId)}/module/${encodeURIComponent(module.index)}/css`)
     .then(async (response) => {
       if (!response.ok) throw new Error("MODULE_CSS_LOAD_FAILED");
-      const payload = await response.json();
+      const payload = await readJsonResponse(response, "模块 CSS 加载失败");
       return String(payload.css || "");
     })
     .catch(() => "");
@@ -1241,7 +1269,21 @@ function setBatchProgress({ title, detail, completed, total }) {
   batchProgressTrack.setAttribute("aria-valuenow", String(percent));
 }
 
-async function generateLiquid(module, { signal, reveal = true } = {}) {
+function waitForRetry(ms, signal) {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer;
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+async function generateLiquid(module, { signal, reveal = true, compactMode = false, compactLevel = 0 } = {}) {
   const previous = liquidResults.get(module.index);
   liquidResults.set(module.index, { ...previous, status: "loading", error: "" });
   syncModuleCard(module.index);
@@ -1259,11 +1301,13 @@ async function generateLiquid(module, { signal, reveal = true } = {}) {
         css,
         reviewLimit: selectedReviewLimit(module),
         replacements: collectReplacements(),
-        imageReplacements: moduleImageReplacementList(module.index)
+        imageReplacements: moduleImageReplacementList(module.index),
+        compactMode,
+        compactLevel
       }),
       signal
     });
-    const data = await response.json();
+    const data = await readJsonResponse(response, "Custom Liquid 生成失败");
     if (!response.ok) {
       const error = new Error(data.error || "Custom Liquid 生成失败");
       error.code = data.code;
@@ -1299,6 +1343,37 @@ async function generateLiquid(module, { signal, reveal = true } = {}) {
   }
 }
 
+async function generateLiquidWithRetry(module, {
+  signal,
+  reveal = true,
+  maxRetries = BATCH_GENERATION_MAX_RETRIES,
+  onAttempt,
+  onRetry
+} = {}) {
+  let result;
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt += 1) {
+    onAttempt?.(attempt);
+    result = await generateLiquid(module, {
+      signal,
+      reveal,
+      compactMode: attempt > 1,
+      compactLevel: Math.max(0, attempt - 1)
+    });
+    if (result.cancelled || result.ok) return result;
+
+    const fatal = FATAL_GENERATION_ERROR_CODES.has(result.error?.code);
+    const shouldRetry = !fatal &&
+      result.error?.retryable !== false &&
+      attempt <= maxRetries &&
+      !signal?.aborted;
+    if (!shouldRetry) return result;
+
+    onRetry?.(attempt);
+    await waitForRetry(Math.min(2500, 900 * attempt), signal);
+  }
+  return result;
+}
+
 async function generateSelectedModules() {
   const pending = selectedPendingModules();
   if (!pending.length || batchActive) return;
@@ -1308,37 +1383,71 @@ async function generateSelectedModules() {
   let completed = 0;
   let successes = 0;
   let failures = 0;
-  setBatchProgress({ title: "开始生成 Custom Liquid", detail: `共 ${pending.length} 个模块，将按顺序发送以控制 API 用量`, completed, total: pending.length });
+  let retries = 0;
+  const concurrency = Math.min(BATCH_GENERATION_CONCURRENCY, pending.length);
+  setBatchProgress({ title: "开始生成 Custom Liquid", detail: `共 ${pending.length} 个模块，并发 ${concurrency} 个生成，失败自动重试 ${BATCH_GENERATION_MAX_RETRIES} 次`, completed, total: pending.length });
 
-  const fatalCodes = new Set([
-    "DEEPSEEK_NOT_CONFIGURED", "DEEPSEEK_AUTH_FAILED", "DEEPSEEK_BALANCE_EMPTY",
-    "DEEPSEEK_RATE_LIMITED", "DEEPSEEK_OVERLOADED", "DEEPSEEK_SERVER_ERROR",
-    "EXTRACTION_EXPIRED"
-  ]);
+  const queue = [...pending];
+  const activeLabels = new Map();
+  let fatalStop = false;
+  let started = 0;
 
-  for (const module of pending) {
-    if (batchController.signal.aborted) break;
+  const renderQueueProgress = () => {
+    const running = [...activeLabels.values()].slice(0, 3).join("、");
     setBatchProgress({
-      title: `正在生成模块 ${module.index}`,
-      detail: `${completed + 1} / ${pending.length}，${module.heading || module.id || module.tag}`,
+      title: running ? `正在生成：${running}` : "正在生成选中模块",
+      detail: `${completed} / ${pending.length} 已完成，成功 ${successes} 个，失败 ${failures} 个，已自动重试 ${retries} 次${running ? `；并发 ${activeLabels.size}/${concurrency}` : ""}`,
       completed,
       total: pending.length
     });
-    const result = await generateLiquid(module, { signal: batchController.signal, reveal: false });
-    if (result.cancelled) break;
-    completed += 1;
-    if (result.ok) successes += 1;
-    else failures += 1;
-    if (fatalCodes.has(result.error?.code)) break;
-  }
+  };
+
+  const worker = async () => {
+    while (!batchController.signal.aborted && !fatalStop) {
+      const module = queue.shift();
+      if (!module) return;
+      started += 1;
+      const result = await generateLiquidWithRetry(module, {
+        signal: batchController.signal,
+        reveal: false,
+        onAttempt: (attempt) => {
+          const label = attempt === 1
+            ? `模块 ${module.index}`
+            : `模块 ${module.index} 压缩重试 ${attempt - 1}/${BATCH_GENERATION_MAX_RETRIES}`;
+          activeLabels.set(module.index, label);
+          renderQueueProgress();
+        },
+        onRetry: () => {
+          activeLabels.delete(module.index);
+          retries += 1;
+          activeLabels.set(module.index, `模块 ${module.index} 等待压缩重试`);
+          renderQueueProgress();
+        }
+      });
+      activeLabels.delete(module.index);
+      if (result.cancelled) return;
+      completed += 1;
+      if (result.ok) successes += 1;
+      else {
+        failures += 1;
+        if (FATAL_GENERATION_ERROR_CODES.has(result.error?.code)) {
+          fatalStop = true;
+          batchController.abort();
+        }
+      }
+      renderQueueProgress();
+    }
+  };
+
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
   const cancelled = batchController.signal.aborted;
   batchActive = false;
   batchController = null;
   updateBatchControls();
   setBatchProgress({
-    title: cancelled ? "已停止生成" : failures ? "批量生成已结束" : "选中模块已生成",
-    detail: `成功 ${successes} 个，失败 ${failures} 个${cancelled ? "，未开始的模块不会产生费用" : ""}`,
+    title: cancelled && !fatalStop ? "已停止生成" : failures ? "批量生成已结束" : "选中模块已生成",
+    detail: `已开始 ${started} / ${pending.length} 个，成功 ${successes} 个，失败 ${failures} 个，自动重试 ${retries} 次${cancelled && !fatalStop ? "，未开始的模块不会产生费用" : ""}`,
     completed,
     total: pending.length
   });
@@ -1394,7 +1503,12 @@ moduleList.addEventListener("click", async (event) => {
   if (action === "toggle-inclusion") return toggleModuleInclusion(card, module);
   if (action === "replace-images") return openImageReplacementDrawer(module);
   if (action === "preview" || action === "source" || action === "liquid-preview" || action === "liquid-code") return showModuleView(card, module, action);
-  if (action === "generate-liquid" || action === "retry-liquid") return generateLiquid(module);
+  if (action === "generate-liquid" || action === "retry-liquid") {
+    return generateLiquidWithRetry(module, {
+      reveal: true,
+      onRetry: () => showToast(`模块 ${module.index} 生成失败，正在自动重试`)
+    });
+  }
   if (action === "copy-liquid") {
     const code = liquidResults.get(module.index).code;
     if (new Blob([code]).size > SHOPIFY_CUSTOM_LIQUID_SAFE_BYTES) {
@@ -1572,7 +1686,7 @@ testModelSettingsButton.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(modelSettingsPayload())
     });
-    const data = await response.json();
+    const data = await readJsonResponse(response, "连接测试失败");
     if (!response.ok) throw new Error(data.error || "连接测试失败");
     renderModelSuggestions(data.models || []);
     const selectedModel = aiModelInput.value.trim();
@@ -1613,7 +1727,7 @@ modelSettingsForm.addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(modelSettingsPayload())
     });
-    const data = await response.json();
+    const data = await readJsonResponse(response, "保存配置失败");
     if (!response.ok) throw new Error(data.error || "保存失败");
     populateModelSettings(data);
     setModelSettingsStatus(`已保存，下一次生成将使用 ${data.model}`, "success");
@@ -1631,7 +1745,7 @@ restoreEnvSettingsButton.addEventListener("click", async () => {
   setModelSettingsStatus("正在恢复 .env 配置", "checking");
   try {
     const response = await fetch("/api/ai/config", { method: "DELETE" });
-    const data = await response.json();
+    const data = await readJsonResponse(response, "恢复配置失败");
     if (!response.ok) throw new Error(data.error || "恢复失败");
     populateModelSettings(data);
     setModelSettingsStatus("已恢复 .env 配置", "success");
@@ -1654,7 +1768,7 @@ async function loadAiStatus() {
   aiStatusLabel.textContent = "正在检查模型配置";
   try {
     const response = await fetch("/api/ai/status");
-    const data = await response.json();
+    const data = await readJsonResponse(response, "无法读取模型状态");
     aiConfig = { ...data, checking: false };
     if (data.configured) {
       aiStatusLabel.dataset.state = "ready";
@@ -1691,7 +1805,7 @@ form.addEventListener("submit", async (event) => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ url: urlInput.value })
     });
-    const data = await response.json();
+    const data = await readJsonResponse(response, "提取产品页面失败");
     if (!response.ok) throw new Error(data.error || "提取失败");
     extraction = data;
     includedModules.clear();

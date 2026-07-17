@@ -26,6 +26,8 @@ const chromePath = process.env.CHROME_PATH || "C:\\Program Files\\Google\\Chrome
 const sourceViewport = { width: 1440, height: 1000 };
 const extractionSessions = new Map();
 const extractionTtlMs = Number(process.env.EXTRACTION_TTL_MS || 4 * 60 * 60 * 1000);
+const vercelConvertTimeoutMs = Math.max(35_000, Math.min(Number(process.env.VERCEL_CONVERT_TIMEOUT_MS || 50_000), 52_000));
+const vercelAiTimeoutMs = Math.max(30_000, Math.min(Number(process.env.VERCEL_AI_TIMEOUT_MS || 45_000), vercelConvertTimeoutMs - 2_000));
 const maxExtractionSessions = 20;
 const maxCapturedCssBytes = 1_500_000;
 const maxSingleStylesheetBytes = 500_000;
@@ -43,8 +45,19 @@ function loadManualAiSettings() {
 
 let manualAiSettings = loadManualAiSettings();
 
+function clampAiTimeoutForRuntime(env) {
+  if (!isVercelRuntime) return env;
+  const requested = Number(env.AI_TIMEOUT_MS || env.DEEPSEEK_TIMEOUT_MS || vercelAiTimeoutMs);
+  const timeoutMs = Math.min(Number.isFinite(requested) ? requested : vercelAiTimeoutMs, vercelAiTimeoutMs);
+  return {
+    ...env,
+    AI_TIMEOUT_MS: String(timeoutMs),
+    DEEPSEEK_TIMEOUT_MS: String(timeoutMs)
+  };
+}
+
 function effectiveAiEnvironment(settings = manualAiSettings) {
-  return settings ? aiSettingsEnvironment(settings) : process.env;
+  return clampAiTimeoutForRuntime(settings ? aiSettingsEnvironment(settings) : process.env);
 }
 
 function effectiveAiConfig(settings = manualAiSettings) {
@@ -133,6 +146,50 @@ function formatBytes(bytes) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function escapeHtmlAttribute(value = "") {
+  return String(value).replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;"
+  })[char]);
+}
+
+function htmlWithBaseUrl(html, baseUrl) {
+  const baseTag = `<base href="${escapeHtmlAttribute(baseUrl)}">`;
+  const source = String(html || "");
+  if (/<base\b/i.test(source)) return source.replace(/<base\b[^>]*>/i, baseTag);
+  if (/<head\b[^>]*>/i.test(source)) return source.replace(/<head\b[^>]*>/i, (match) => `${match}\n${baseTag}`);
+  return `${baseTag}\n${source}`;
+}
+
+async function fetchStaticHtml(url) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20_000);
+  try {
+    const response = await fetch(url, {
+      redirect: "follow",
+      headers: {
+        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "accept-language": "en-US,en;q=0.9",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131 Safari/537.36"
+      },
+      signal: controller.signal
+    });
+    const finalUrl = await validatePublicUrl(response.url);
+    const contentType = response.headers.get("content-type") || "";
+    if (!response.ok || !/text\/html|application\/xhtml\+xml/i.test(contentType)) return null;
+    const html = await response.text();
+    if (!html || Buffer.byteLength(html, "utf8") > 3_000_000) return null;
+    return { html, url: finalUrl };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function launchBrowser() {
   if (isVercelRuntime) {
     return playwrightChromium.launch({
@@ -202,8 +259,27 @@ app.post("/api/extract", async (req, res) => {
       await injected?.evaluate((node) => node.setAttribute("data-module-copier-captured-css", "true")).catch(() => {});
     }
 
-    const finalUrl = page.url();
+    let finalUrl = page.url();
     await validatePublicUrl(finalUrl);
+
+    let extractionFallback = "";
+    const hasMainContent = await page.locator("main#MainContent, #MainContent").count().then((count) => count > 0).catch(() => false);
+    if (!hasMainContent) {
+      const debug = await page.evaluate(() => ({
+        title: document.title,
+        url: location.href,
+        bodyText: document.body?.innerText?.slice(0, 220) || ""
+      })).catch(() => null);
+      console.warn("[extract:missing-main-rendered]", { targetUrl, finalUrl, ...debug });
+      const staticPage = await fetchStaticHtml(finalUrl);
+      if (staticPage && /\bid\s*=\s*["']MainContent["']/i.test(staticPage.html)) {
+        extractionFallback = "static-html-maincontent";
+        finalUrl = staticPage.url;
+        await page.setContent(htmlWithBaseUrl(staticPage.html, finalUrl), { waitUntil: "domcontentloaded", timeout: 45000 });
+        await page.waitForTimeout(1200);
+        console.info("[extract:static-html-fallback]", { targetUrl, finalUrl });
+      }
+    }
 
     const result = await page.evaluate(async () => {
       const main = document.querySelector("main#MainContent") || document.querySelector("#MainContent");
@@ -404,6 +480,7 @@ app.post("/api/extract", async (req, res) => {
     });
 
     if (result.error) return res.status(422).json({ error: result.error });
+    result.extractionFallback = extractionFallback;
     const totalBytes = result.modules.reduce((sum, item) => sum + item.size, 0);
     const extractionId = randomUUID();
     extractionSessions.set(extractionId, {
@@ -527,6 +604,8 @@ app.post("/api/ai/test", async (req, res) => {
 
 app.post("/api/convert", async (req, res) => {
   const requestController = new AbortController();
+  const requestId = randomUUID().slice(0, 8);
+  let convertTimer;
   res.on("close", () => {
     if (!res.writableEnded) requestController.abort();
   });
@@ -559,8 +638,18 @@ app.post("/api/convert", async (req, res) => {
     const cssForConversion = imageReplacements.length
       ? applyImageReplacementsToText(sourceCss, imageReplacements)
       : sourceCss;
+    const compactLevel = Math.max(0, Math.min(2, Number(req.body?.compactLevel) || 0));
+    const compactMode = Boolean(req.body?.compactMode) || compactLevel > 0;
     const namespace = `ai-liquid-${extractionId.replace(/-/g, "").slice(0, 10)}-${module.index}`;
-    const result = await convertModuleToCustomLiquid({
+    console.info("[convert:start]", {
+      requestId,
+      moduleIndex: module.index,
+      model: effectiveAiConfig().model,
+      compactMode,
+      compactLevel,
+      timeoutMs: isVercelRuntime ? vercelConvertTimeoutMs : effectiveAiConfig().timeoutMs
+    });
+    const conversionPromise = convertModuleToCustomLiquid({
       module: moduleForConversion,
       css: cssForConversion,
       sourceUrl: session?.url || String(req.body?.sourceUrl || ""),
@@ -568,8 +657,25 @@ app.post("/api/convert", async (req, res) => {
       reviewLimit: req.body?.reviewLimit,
       namespace,
       env: effectiveAiEnvironment(),
-      signal: requestController.signal
+      signal: requestController.signal,
+      compactMode,
+      compactLevel
     });
+    const timeoutPromise = new Promise((_, reject) => {
+      if (!isVercelRuntime) return;
+      convertTimer = setTimeout(() => {
+        reject(new ConversionError("单个模块生成超过线上时限，已自动交给前端重试；如果连续失败，请缩小模块或更换更快模型", {
+          code: "DEEPSEEK_TIMEOUT",
+          status: 504,
+          retryable: true
+        }));
+        requestController.abort();
+      }, vercelConvertTimeoutMs);
+    });
+    const result = isVercelRuntime
+      ? await Promise.race([conversionPromise, timeoutPromise])
+      : await conversionPromise;
+    console.info("[convert:success]", { requestId, moduleIndex: module.index, bytes: Buffer.byteLength(result.code || "", "utf8") });
     res.json({
       ok: true,
       moduleIndex: module.index,
@@ -578,11 +684,20 @@ app.post("/api/convert", async (req, res) => {
     });
   } catch (error) {
     const status = error instanceof ConversionError ? error.status : 500;
+    console.warn("[convert:error]", {
+      requestId,
+      moduleIndex: Number(req.body?.moduleIndex),
+      code: error?.code || "CONVERSION_FAILED",
+      status,
+      retryable: Boolean(error?.retryable)
+    });
     res.status(status).json({
       error: error?.message || "Custom Liquid 生成失败",
       code: error?.code || "CONVERSION_FAILED",
       retryable: Boolean(error?.retryable)
     });
+  } finally {
+    clearTimeout(convertTimer);
   }
 });
 
